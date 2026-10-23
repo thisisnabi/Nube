@@ -1,0 +1,33 @@
+# Redis with persistent storage. A "local" volume lives on one node;
+# the scheduler keeps the pod on that node so the data follows it.
+kind: Volume
+metadata:
+  name: redis-data
+spec:
+  type: local
+  size: 1Gi
+---
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  strategy: { maxSurge: 0, maxUnavailable: 1 }   # never run two copies on one volume
+  template:
+    image: redis:7-alpine
+    args: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - containerPort: 6379
+    resources: { cpu: 100m, memory: 128Mi }
+    volumes:
+      - volume: redis-data
+        containerPath: /data
+    healthCheck:
+      tcpSocket: { port: 6379 }
+---
+kind: Service
+metadata:
+  name: redis
+spec:
+  ports:
+    - port: 6379

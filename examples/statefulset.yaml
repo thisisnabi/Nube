@@ -1,0 +1,32 @@
+# A replicated database: stable pod names (pg-0, pg-1), ordered start-up,
+# one size-limited volume per replica, and per-pod DNS through a headless service.
+kind: Secret
+metadata:
+  name: pg-auth
+stringData:
+  POSTGRES_PASSWORD: change-me
+---
+kind: Service
+metadata:
+  name: pg
+spec:
+  headless: true                 # pg resolves to every pod; pg-0.pg to the first one
+  ports: [{ port: 5432 }]
+---
+kind: StatefulSet
+metadata:
+  name: pg
+spec:
+  replicas: 2
+  serviceName: pg
+  template:
+    image: postgres:17-alpine
+    envFrom: [{ secret: pg-auth }]
+    env: { PGDATA: /var/lib/postgresql/data/pgdata }
+    ports: [{ containerPort: 5432 }]
+    resources: { cpu: 500m, memory: 512Mi }
+    volumes: [{ volume: data, containerPath: /var/lib/postgresql/data }]
+    healthCheck: { tcpSocket: { port: 5432 }, initialDelaySeconds: 5 }
+  volumeClaimTemplates:
+    - name: data                 # creates volumes data-pg-0, data-pg-1
+      spec: { type: local, size: 5Gi }

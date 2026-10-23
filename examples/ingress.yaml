@@ -1,0 +1,22 @@
+# HTTP(S) routing by host name and path on ports 80/443 of the servers.
+# Point app.example.com's DNS at your server(s).
+#
+# Real certificate (e.g. from certbot):
+#   kind: Secret, type: tls, stringData: { tls.crt: "...", tls.key: "..." }
+# Without secretName a self-signed certificate is served.
+kind: Ingress
+metadata:
+  name: web
+spec:
+  redirectHTTP: true
+  tls:
+    - hosts: [app.example.com]
+      # secretName: app-tls
+  rules:
+    - host: app.example.com
+      paths:
+        - { path: /api, backend: { service: api, port: 9000 } }
+        - { path: /, backend: { service: web, port: 8080 } }
+    - host: "*.example.com"
+      paths:
+        - { path: /, backend: { service: web, port: 8080 } }

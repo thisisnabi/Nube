@@ -1,0 +1,4 @@
+dist/
+test/e2e/nube
+test/e2e/images/
+*.tar

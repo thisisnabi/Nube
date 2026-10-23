@@ -1,0 +1,17 @@
+[Unit]
+Description=Nube node agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+EnvironmentFile=/etc/nube/agent.env
+ExecStart=/usr/local/bin/nube agent
+Restart=always
+RestartSec=3
+# Only stop the agent itself; pods keep running across agent restarts/upgrades.
+KillMode=process
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nube Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M9 24h14a6 6 0 0 0 .7-12A8 8 0 0 0 8.4 13 5.5 5.5 0 0 0 9 24z' fill='%236d8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form class="login-card" id="login-form">
+    <div class="brand big"><span class="logo"></span>Nube</div>
+    <p class="muted">Enter the cluster token. On the server it is in <code>/var/lib/nube/token</code>.</p>
+    <input id="token-input" type="password" placeholder="Cluster token" autocomplete="current-password" required>
+    <button class="btn primary" type="submit">Connect</button>
+    <p id="login-error" class="error-text"></p>
+  </form>
+</div>
+
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand"><span class="logo"></span>Nube</div>
+    <nav id="nav">
+      <a data-view="overview" class="active"><i>◎</i>Overview</a>
+      <a data-view="nodes"><i>▣</i>Nodes</a>
+      <a data-view="deployments"><i>⟳</i>Deployments</a>
+      <a data-view="statefulsets"><i>⧉</i>StatefulSets</a>
+      <a data-view="jobs"><i>⏱</i>Jobs &amp; CronJobs</a>
+      <a data-view="pods"><i>●</i>Pods</a>
+      <a data-view="services"><i>⇄</i>Services</a>
+      <a data-view="ingresses"><i>⇢</i>Ingress</a>
+      <a data-view="volumes"><i>▤</i>Volumes</a>
+      <a data-view="config"><i>⚙</i>Config &amp; Secrets</a>
+      <a data-view="events"><i>≡</i>Events</a>
+      <a data-view="tokens"><i>⚿</i>Access tokens</a>
+      <a data-view="cluster"><i>◈</i>Control Plane</a>
+      <a data-view="apply"><i>＋</i>Apply YAML</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div id="version" class="muted small"></div>
+      <button class="btn ghost small" id="theme-btn" title="Toggle theme">◐ Theme</button>
+      <button class="btn ghost small" id="logout-btn">Sign out</button>
+    </div>
+  </aside>
+  <main>
+    <header class="topbar">
+      <button class="btn ghost menu-btn" id="menu-btn" aria-label="Menu">☰</button>
+      <h1 id="title">Overview</h1>
+      <div class="topbar-right">
+        <span id="leader-pill" class="pill"></span>
+        <label class="ns-select">Namespace
+          <select id="ns"></select>
+        </label>
+        <span id="live" class="live" title="Live updates"></span>
+      </div>
+    </header>
+    <section id="view" class="view"></section>
+  </main>
+</div>
+
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="modal-title"></h2>
+      <div id="modal-actions"></div>
+      <button class="btn ghost" id="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+<div id="toasts" class="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

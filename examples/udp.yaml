@@ -1,0 +1,16 @@
+# A UDP service (e.g. a game server, DNS, syslog): an echo server here.
+kind: Deployment
+metadata:
+  name: echo-udp
+spec:
+  template:
+    image: alpine/socat
+    args: ["UDP-RECVFROM:9000,fork", "EXEC:cat"]
+    ports: [{ containerPort: 9000, protocol: UDP }]
+---
+kind: Service
+metadata:
+  name: echo-udp
+spec:
+  ports: [{ port: 9000, protocol: UDP }]
+# Test from anywhere:  echo hi | nc -u -w1 SERVER_IP 9000

@@ -1,0 +1,4 @@
+FROM alpine:3.20
+COPY nube /usr/local/bin/nube
+RUN chmod +x /usr/local/bin/nube
+ENTRYPOINT ["nube", "server"]

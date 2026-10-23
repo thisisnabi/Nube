@@ -1,0 +1,14 @@
+[Unit]
+Description=Nube control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/nube/server.env
+ExecStart=/usr/local/bin/nube server
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

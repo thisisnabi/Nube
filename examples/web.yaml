@@ -1,0 +1,25 @@
+# A replicated web server behind a load-balanced service.
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  template:
+    image: nginx:alpine
+    ports:
+      - containerPort: 80
+    resources:
+      cpu: 100m
+      memory: 64Mi
+    healthCheck:
+      httpGet: { path: /, port: 80 }
+      periodSeconds: 5
+---
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: { app: web }
+  ports:
+    - port: 8080        # exposed on every control-plane server
+      targetPort: 80    # container port

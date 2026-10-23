@@ -1,0 +1,44 @@
+# PostgreSQL with a secret password and persistent storage.
+# Other pods reach it at postgres:5432 (DNS name postgres.default.svc.nube).
+kind: Secret
+metadata:
+  name: pg-auth
+stringData:
+  POSTGRES_PASSWORD: change-me
+  POSTGRES_DB: app
+---
+kind: Volume
+metadata:
+  name: pg-data
+spec:
+  type: local
+  size: 10Gi
+---
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  strategy: { maxSurge: 0, maxUnavailable: 1 }   # one writer per volume
+  template:
+    image: postgres:17-alpine
+    envFrom:
+      - secret: pg-auth
+    env:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - containerPort: 5432
+    resources: { cpu: 500m, memory: 512Mi }
+    volumes:
+      - volume: pg-data
+        containerPath: /var/lib/postgresql/data
+    healthCheck:
+      tcpSocket: { port: 5432 }
+      initialDelaySeconds: 5
+---
+kind: Service
+metadata:
+  name: postgres
+spec:
+  ports:
+    - port: 5432

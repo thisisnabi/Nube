@@ -1,0 +1,28 @@
+# A shared NFS volume: usable from every node, so pods using it can move freely
+# and survive the loss of any node. Needs an NFS server (e.g. a NAS, or
+# `apt install nfs-kernel-server` on one machine) and nfs-common on the nodes
+# (install.sh installs it).
+kind: Volume
+metadata:
+  name: shared-files
+spec:
+  type: nfs
+  size: 50Gi
+  nfs:
+    server: 192.168.1.10
+    path: /exports/shared
+    options: nfsvers=4.1
+---
+kind: Deployment
+metadata:
+  name: files
+spec:
+  replicas: 2            # NFS allows many writers
+  template:
+    image: nginx:alpine
+    ports:
+      - containerPort: 80
+    volumes:
+      - volume: shared-files
+        containerPath: /usr/share/nginx/html
+        readOnly: true

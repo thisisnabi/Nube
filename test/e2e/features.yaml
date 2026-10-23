@@ -1,0 +1,102 @@
+# End-to-end manifest exercising multi-container pods, init containers,
+# emptyDirs, StatefulSets with sized volumes, Jobs, CronJobs, UDP services
+# and Ingress.
+
+# --- multi-container pod: init container writes the page, nginx serves it,
+#     a sidecar checks it over localhost.
+kind: Deployment
+metadata:
+  name: blog
+spec:
+  replicas: 2
+  template:
+    emptyDirs:
+      - { name: html, sizeLimit: 16Mi }
+    initContainers:
+      - name: setup
+        image: busybox:1.36
+        command: ["sh", "-c", "echo '<h1>hello from init</h1>' > /html/index.html"]
+        volumes: [{ emptyDir: html, containerPath: /html }]
+    containers:
+      - name: web
+        image: nginx:alpine
+        ports: [{ containerPort: 80 }]
+        volumes: [{ emptyDir: html, containerPath: /usr/share/nginx/html }]
+        healthCheck: { httpGet: { path: /, port: 80 }, periodSeconds: 3 }
+      - name: checker
+        image: busybox:1.36
+        command: ["sh", "-c", "while true; do wget -qO- http://localhost/ | grep -q 'hello from init' && echo localhost-ok; sleep 5; done"]
+---
+kind: Service
+metadata: { name: blog }
+spec:
+  ports: [{ port: 8080, targetPort: 80 }]
+---
+kind: Ingress
+metadata: { name: blog }
+spec:
+  tls:
+    - hosts: [blog.example.com]
+  rules:
+    - host: blog.example.com
+      paths:
+        - { path: /, backend: { service: blog, port: 8080 } }
+    - paths:
+        - { path: /healthz, pathType: Exact, backend: { service: blog, port: 8080 } }
+---
+# --- StatefulSet with a headless service and per-replica sized volumes.
+kind: Service
+metadata: { name: db }
+spec:
+  headless: true
+  ports: [{ port: 6379 }]
+---
+kind: StatefulSet
+metadata: { name: db }
+spec:
+  replicas: 2
+  serviceName: db
+  template:
+    image: redis:7-alpine
+    ports: [{ containerPort: 6379 }]
+    volumes: [{ volume: data, containerPath: /data }]
+    healthCheck: { tcpSocket: { port: 6379 } }
+  volumeClaimTemplates:
+    - name: data
+      spec: { type: local, size: 64Mi }
+---
+# --- Job: 3 completions, 2 at a time.
+kind: Job
+metadata: { name: batch }
+spec:
+  completions: 3
+  parallelism: 2
+  template:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo working on $NUBE_POD_NAME; sleep 3"]
+---
+# --- CronJob every minute.
+kind: CronJob
+metadata: { name: tick }
+spec:
+  schedule: "* * * * *"
+  successfulJobsHistoryLimit: 2
+  jobTemplate:
+    template:
+      image: busybox:1.36
+      command: ["sh", "-c", "date"]
+---
+# --- UDP echo server.
+kind: Deployment
+metadata: { name: echo-udp }
+spec:
+  template:
+    image: alpine/socat
+    imagePullPolicy: IfNotPresent
+    args: ["UDP-RECVFROM:9000,fork", "EXEC:cat"]
+    ports: [{ containerPort: 9000, protocol: UDP }]
+---
+kind: Service
+metadata: { name: echo-udp }
+spec:
+  ports: [{ port: 9000, protocol: UDP }]
