@@ -1,74 +1,97 @@
-# Nube — یک ارکستریتور کانتینر شبیه Kubernetes، از صفر
+# Nube
 
-Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور کانتینر کوچک ولی واقعی است که با Go نوشته شده.
-یک باینری (`nube`) هم control plane است، هم agent نودها و هم CLI. یک داشبورد وب هم داخلش embed شده.
+**A small, real Kubernetes-like container orchestrator, written from scratch in Go.**
+
+One binary (`nube`) is the control plane, the node agent and the CLI, with a web dashboard built in.
+It runs your containers on Docker across one or many Linux machines, keeps them healthy, networks them
+together, and survives the loss of a node or a control-plane server.
+
+[فارسی](README.fa.md)
 
 ```
-                 ┌──────────── control plane (۱ یا ۳ سرور، Raft، HTTPS) ────────────┐
-   nube CLI ───► │ REST API · RBAC · scheduler · controllers · LB · Ingress · UI   │
-   مرورگر   ───► │ state store (فایل JSON یا Raft تکثیرشده) · cluster CA          │
-                 └──────────────▲──────────────────────────────▲──────────────────┘
-                   sync (HTTPS + node token)        sync (HTTPS + node token)
-                 ┌──────────────┴─────────┐   ┌────────────────┴───────┐
-                 │ node agent  (Docker)   │   │ node agent  (Docker)   │
-                 │ pods 10.88.1.0/24      │◄─►│ pods 10.88.2.0/24      │
-                 │ DNS + service proxy    │ WireGuard   DNS + proxy    │
-                 └────────────────────────┘   └────────────────────────┘
+                ┌──────────── control plane (1 or 3 servers, Raft, HTTPS) ────────────┐
+  nube CLI ───► │  REST API · RBAC · scheduler · controllers · LB · Ingress · UI      │
+  browser  ───► │  state store (JSON file or Raft-replicated) · cluster CA           │
+                └───────────────▲───────────────────────────────▲─────────────────────┘
+                  sync (HTTPS + node token)         sync (HTTPS + node token)
+                ┌───────────────┴────────┐   ┌──────────────────┴─────┐
+                │ node agent  (Docker)   │   │ node agent  (Docker)   │
+                │ pods 10.88.1.0/24      │◄─►│ pods 10.88.2.0/24      │
+                │ DNS + service proxy    │ WireGuard   DNS + proxy    │
+                └────────────────────────┘   └────────────────────────┘
 ```
 
-## قابلیت‌ها
+> Nube is built for learning how orchestrators really work, for homelabs and for personal projects.
+> It is not a drop-in replacement for Kubernetes in production — see [Limitations](#limitations).
 
-| حوزه | چه چیزی پیاده شده |
+## Features
+
+| Area | What you get |
 |---|---|
-| **Pod** | چند کانتینر در هر pod که `localhost` مشترک دارند (مثل Kubernetes، با یک کانتینر pause که صاحب شبکه است)، init container که به ترتیب اجرا می‌شود، و `emptyDir` مشترک (روی دیسک یا حافظه، با محدودیت حجم) |
-| **Workloads** | `Deployment` با rolling update، rollback و autoscale. `StatefulSet` با نام‌های پایدار (`db-0`، `db-1`)، شروع مرتب، یک volume برای هر replica و DNS برای هر pod. `Job` با completions، parallelism، backoffLimit و deadline. `CronJob` با زمان‌بندی cron و time zone و concurrencyPolicy |
-| **Scheduler** | فیلتر بر اساس Ready/cordon، `nodeSelector`، CPU/RAM درخواستی، host port و محل volume. پخش replicaها روی نودهای مختلف |
-| **Self-healing** | restart با backoff نمایی برای هر کانتینر، health check از نوع HTTP و TCP، جابه‌جایی podها وقتی نودی از دست می‌رود |
-| **Networking** | subnet جداگانه برای هر نود، overlay رمزنگاری‌شده با **WireGuard** (یا host-gw)، ارتباط مستقیم pod به pod |
-| **Services** | **TCP و UDP**، پراکسی روی هر نود (شبیه ClusterIP)، سرویس‌های `headless` (DNS مستقیم به IP podها) و `internal` (فقط داخل کلاستر)، load balancer روی سرورها |
-| **Ingress** | مسیریابی HTTP/HTTPS بر اساس hostname (شامل `*.example.com`) و path روی پورت‌های 80/443، با TLS از یک Secret نوع `tls` یا گواهی self-signed، و redirect از HTTP به HTTPS |
-| **DNS** | `web`، `web.prod`، `web.default.svc.nube`، `db-0.db` و `POD.default.pod.nube` |
-| **Storage** | `Volume` از نوع `local` با **حجم اجباری** (هر volume یک فایل‌سیستم ext4 مستقل است و بیشتر از اندازه‌اش نمی‌شود نوشت)، `nfs` و `hostPath`. گزارش مصرف واقعی هر volume |
-| **امنیت** | **API روی HTTPS** با CA اختصاصی کلاستر (کلاینت‌ها hash آن را pin می‌کنند)، **mutual TLS** بین سرور و agentها، **توکن‌های چندگانه با نقش** (`admin`، `edit`، `view`، `node`) و محدودسازی به namespace، و ماسک‌شدن مقدار secretها |
-| **High availability** | ۳ (یا ۵) سرور با **Raft**. در صورت از کار افتادن leader، ظرف چند ثانیه leader جدید انتخاب می‌شود. agentها خودکار به سرور سالم سوییچ می‌کنند |
-| **Observability** | داشبورد زنده، رویدادها، لاگ زنده‌ی هر کانتینر (`logs -c`)، مصرف CPU، RAM و دیسک |
+| **Pods** | Multiple containers sharing `localhost` (a pause container owns the network, like Kubernetes), init containers that run in order, shared `emptyDir` scratch volumes on disk or in memory with size limits |
+| **Workloads** | `Deployment` with rolling updates, rollback, pause/resume and CPU autoscaling · `StatefulSet` with stable names (`db-0`, `db-1`), ordered start-up, a volume per replica and per-pod DNS · `Job` with completions, parallelism, backoff limit and deadline · `CronJob` with cron schedules, time zones and concurrency policy |
+| **Scheduler** | Filters on readiness, cordoning, `nodeSelector`, CPU/memory requests, host ports and volume location; spreads replicas across nodes |
+| **Self-healing** | Per-container restart with exponential back-off (CrashLoopBackOff), HTTP and TCP health checks, rescheduling when a node is lost |
+| **Networking** | A pod subnet per node, an encrypted **WireGuard** overlay (or host-gw), direct pod-to-pod traffic |
+| **Services** | **TCP and UDP**, a node-local proxy on every node (like a ClusterIP), `headless` and `internal` services, a load balancer on every control-plane server |
+| **Ingress** | HTTP/HTTPS routing by host (including `*.example.com`) and path on ports 80/443, TLS from a `tls` Secret or a self-signed fallback, HTTP→HTTPS redirect |
+| **DNS** | `web`, `web.prod`, `web.default.svc.nube`, `db-0.db`, `POD.default.pod.nube` |
+| **Storage** | `local` volumes with an **enforced size** (each is its own ext4 filesystem — writes past the size fail), `nfs` and `hostPath`; live usage per volume |
+| **Security** | **HTTPS API** with a cluster CA that clients pin by hash, **mutual TLS** between servers and agents, **role-based tokens** (`admin`, `edit`, `view`, `node`) optionally scoped to namespaces, masked secret values |
+| **High availability** | 3 or 5 servers replicated with **Raft**; a new leader is elected within seconds and agents fail over automatically |
+| **Observability** | Live dashboard, events, streaming logs per container, CPU/memory/disk usage, `nube top` |
 
-### چه چیزهایی واقعاً تست شده
-روی یک کلاستر Docker با ۳ سرور HA (با TLS) و ۲ نود (Docker-in-Docker با WireGuard)، و یک نصب تمیز روی Ubuntu 24.04:
+### What has actually been tested
 
-- **Pod چندکانتینری:** init container صفحه را نوشت، nginx سرو کرد، و sidecar از طریق `localhost` به آن رسید.
-- **StatefulSet:** `db-1` فقط بعد از Ready شدن `db-0` بالا آمد. هر replica volume خودش را داشت. `db-0.db` به pod درست resolve شد. rolling restart از بالاترین ordinal انجام شد.
-- **Volume:** نوشتن ۱۰۰MB در یک volume با حجم ۶۴Mi با خطای «No space left on device» متوقف شد.
-- **Job و CronJob:** Job دقیقاً ۳ completion را دوتا‌دوتا اجرا کرد. CronJob هر دقیقه اجرا شد و history limit رعایت شد.
-- **UDP:** سرویس UDP هم داخل کلاستر و هم از طریق load balancer کار کرد.
-- **Ingress:** مسیریابی با host و path، و HTTPS با گواهی همان Secret.
-- **امنیت:** توکن view نتوانست تغییری بدهد، توکن edit محدود به `dev` نتوانست `default` را ببیند، توکن revoke‌شده فوراً از کار افتاد، و CA اشتباه رد شد.
-- **HA:** با kill کردن leader، leader جدید انتخاب شد و درخواست‌ها روی HTTPS به آن فرستاده شد.
+On a Docker test cluster (3 HA servers with TLS + 2 Docker-in-Docker nodes with WireGuard) and on a fresh Ubuntu 24.04 install:
+
+- an init container wrote a page, nginx served it and a sidecar reached it over `localhost`;
+- `db-1` only started once `db-0` was ready, each replica got its own volume, `db-0.db` resolved to the right pod, and a rolling restart went from the highest ordinal down;
+- writing 100 MB into a 64Mi volume stopped with "No space left on device";
+- a Job ran exactly 3 completions two at a time; a CronJob fired every minute and kept its history limit;
+- UDP services worked inside the cluster and through the load balancer;
+- Ingress routed by host and path and served the certificate from a Secret;
+- a `view` token could not change anything, an `edit` token scoped to `dev` could not see `default`, a revoked token stopped working immediately, and a wrong CA hash was rejected;
+- killing the Raft leader elected a new one and writes were forwarded to it over HTTPS;
+- a bad image never took down the running replicas, and rollback restored them.
 
 ---
 
-## نصب روی Ubuntu
+## Install on Ubuntu
 
-### ۱) ساخت (روی ویندوز)
+### 1. Build
+
+On Windows:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
-خروجی: `dist\nube-0.2.0-linux.tar.gz` (باینری amd64 و arm64، اسکریپت نصب، systemd و مثال‌ها) و `dist\nube.exe` برای CLI روی ویندوز.
+On Linux/macOS:
+```bash
+make bundle
+```
+This produces `dist/nube-0.2.0-linux.tar.gz` (amd64 and arm64 binaries, installer, systemd units, examples) and a CLI for your machine.
 
-### ۲) همه‌چیز روی یک ماشین
+You can also install just the CLI with Go 1.25+:
+```bash
+go install github.com/thisisnabi/Nube/cmd/nube@latest
+```
+
+### 2. Everything on one machine
+
 ```bash
 scp dist/nube-0.2.0-linux.tar.gz user@SERVER:~
 ssh user@SERVER
 tar xzf nube-0.2.0-linux.tar.gz && cd nube-0.2.0-linux
 sudo bash install.sh single
 ```
-اسکریپت این کارها را انجام می‌دهد:
-- نصب Docker ‏(`docker.io` از مخزن Ubuntu)، WireGuard، iptables، nfs-common و e2fsprogs
-- ساخت CA کلاستر و توکن admin، و ساخت یک توکن `node` برای agent
-- نصب سرویس‌های systemd و ذخیره‌ی تنظیمات CLI برای کاربر شما
 
-آخر کار آدرس داشبورد (`https://SERVER_IP:7070`)، hash مربوط به CA و دستور اضافه کردن نود را چاپ می‌کند.
-برای حذف هشدار مرورگر، `https://SERVER_IP:7070/ca.crt` را دانلود و به‌عنوان CA قابل‌اعتماد import کنید.
+The installer:
+- installs Docker (`docker.io` from Ubuntu's own repository), WireGuard, iptables, nfs-common and e2fsprogs;
+- creates the cluster CA, an admin token and a `node` token for the agent;
+- installs the `nube-server` and `nube-agent` systemd services and saves the CLI config for your user.
+
+It finishes by printing the dashboard URL (`https://SERVER_IP:7070`), the CA hash and the command to add more nodes.
+To avoid the browser warning, download `https://SERVER_IP:7070/ca.crt` and import it as a trusted CA.
 
 ```bash
 nube get nodes
@@ -76,78 +99,86 @@ nube apply -f examples/web.yaml
 curl http://SERVER_IP:8080
 ```
 
-### ۳) اضافه کردن نود
-همان دستوری که اسکریپت نصب چاپ کرده را روی ماشین دوم اجرا کنید:
+### 3. Add a worker node
+
+Run the command the installer printed on the other machine:
 ```bash
 sudo bash install.sh agent --server https://SERVER_IP:7070 --token nube_xxx --ca-hash sha256:...
 ```
-توکن نود فقط اجازه‌ی ثبت نود و همگام‌سازی podها را دارد. توکن admin هیچ‌وقت روی نودها نمی‌رود.
+A node token can only register a node and sync its pods; the admin token never leaves the servers.
 
-### ۴) control plane با HA ‏(۳ سرور)
+### 4. Highly-available control plane (3 servers)
+
 ```bash
-# سرور ۱
+# server 1
 sudo bash install.sh server --ha --id s1 --bootstrap
-# سرور ۲ و ۳: توکن admin از /var/lib/nube/token و hash از /var/lib/nube/ca.hash سرور ۱
+# servers 2 and 3 — admin token from /var/lib/nube/token and hash from /var/lib/nube/ca.hash on server 1
 sudo bash install.sh server --ha --id s2 --join https://S1_IP:7070 --token ADMIN_TOKEN --ca-hash sha256:...
 sudo bash install.sh server --ha --id s3 --join https://S1_IP:7070 --token ADMIN_TOKEN --ca-hash sha256:...
 ```
-اگر می‌خواهید سرورها خودشان هم pod اجرا کنند، به‌جای `server` از `single` استفاده کنید. کلاستر ۳تایی از دست رفتن یک سرور را تحمل می‌کند.
+Use `single` instead of `server` if the servers should run pods too. Three servers tolerate the loss of one; five tolerate two.
 
-### پورت‌ها
-| پورت | کاربرد |
+### Ports
+
+| Port | Used for |
 |---|---|
-| 7070/tcp | API و داشبورد (HTTPS) |
-| 7071/tcp | API ‏agent (mutual TLS، فقط سرورها) |
-| 7072/tcp | Raft (فقط بین سرورها) |
-| 51820/udp | WireGuard (بین نودها) |
+| 7070/tcp | API and dashboard (HTTPS) |
+| 7071/tcp | Agent API (mutual TLS, servers only) |
+| 7072/tcp | Raft (between servers) |
+| 51820/udp | WireGuard (between nodes) |
 | 80, 443/tcp | Ingress |
-| پورت سرویس‌ها | load balancer روی سرورها |
+| your service ports | Load balancer on the servers |
 
-حذف: `sudo bash install.sh uninstall` (داده‌ها و کانتینرهای در حال اجرا حذف نمی‌شوند).
+Uninstall with `sudo bash install.sh uninstall` (data and running containers are kept).
 
 ---
 
 ## CLI
 
 ```bash
-nube login --server https://SERVER:7070 --token TOKEN      # fingerprint مربوط به CA را نشان می‌دهد و می‌پرسد
-nube apply -f app.yaml
-nube get nodes|deploy|sts|jobs|cronjobs|pods|svc|ing|cm|secrets|volumes [-n NS | -A] [-o wide|yaml] [-w]
+nube login --server https://SERVER:7070 --token TOKEN    # shows the CA fingerprint and asks before trusting it
+nube apply -f app.yaml                                   # file, directory or - for stdin
+nube get nodes|deploy|sts|jobs|cronjobs|pods|svc|ing|cm|secrets|volumes [-n NS | -A] [-o wide|json|yaml] [-w]
 nube describe pod NAME
-nube logs POD [-c CONTAINER] [-f]
+nube logs POD [-c CONTAINER] [-f] [--tail N]
 nube scale deploy|sts NAME --replicas 5
 nube set image deploy NAME nginx:1.27 [-c CONTAINER]
-nube rollout status|history|undo|restart deploy|sts NAME
-nube trigger cronjob NAME          # اجرای فوری
+nube rollout status|history|undo|restart|pause|resume deploy|sts NAME
+nube trigger cronjob NAME                                # run now
 nube suspend|resume cronjob NAME
-nube token create ci --role edit -n prod       # فقط یک بار نشان داده می‌شود
+nube token create ci --role edit -n prod                 # the secret is shown once
 nube token list | nube token delete ci
 nube whoami
 nube top nodes|pods
 nube cordon|uncordon|drain NODE
+nube label node NAME key=value
+nube events -w
 nube cluster status
 ```
 
-### نقش‌ها
-| نقش | اجازه |
+### Roles
+
+| Role | Can |
 |---|---|
-| `admin` | همه‌چیز: نودها، توکن‌ها و HA |
-| `edit` | خواندن و تغییر workloadها، configها و secretها (اگر namespace داده شود، فقط در همان namespaceها) |
-| `view` | فقط خواندن (بدون دیدن مقدار secretها) |
-| `node` | فقط برای agentها: ثبت نود و همگام‌سازی |
+| `admin` | everything, including nodes, tokens and HA membership |
+| `edit` | read and change workloads, config and secrets (only in its namespaces, if any are given) |
+| `view` | read everything except secret values |
+| `node` | agents only: register a node and sync its pods |
 
 ---
 
-## مرجع manifest (خلاصه)
+## Manifest reference (short)
 
 ```yaml
-kind: Deployment            # یا StatefulSet / Job / Pod
+kind: Deployment              # or StatefulSet / Job / Pod
 metadata: { name: app, namespace: default }
 spec:
   replicas: 3
+  strategy: { maxSurge: 1, maxUnavailable: 0 }
+  autoscale: { min: 2, max: 10, targetCPUPercent: 70 }
   template:
-    # یک کانتینر: فیلدها مستقیم اینجا (image, command, ports, ...)
-    # چند کانتینر:
+    # One container: put image, command, ports ... directly here.
+    # Several containers:
     emptyDirs: [{ name: cache, sizeLimit: 256Mi, medium: Memory }]
     initContainers:
       - { name: migrate, image: myapp, command: ["./migrate"] }
@@ -160,8 +191,8 @@ spec:
         resources: { cpu: 250m, memory: 256Mi }
         healthCheck: { httpGet: { path: /healthz, port: 8080 } }
         volumes:
-          - { volume: data, containerPath: /data }     # Volume کلاستر
-          - { emptyDir: cache, containerPath: /cache }  # مشترک بین کانتینرهای pod
+          - { volume: data, containerPath: /data }      # cluster Volume
+          - { emptyDir: cache, containerPath: /cache }   # shared by the pod's containers
       - name: sidecar
         image: busybox
     restartPolicy: Always    # Always | OnFailure | Never
@@ -170,69 +201,93 @@ kind: Service
 metadata: { name: app }
 spec:
   ports: [{ port: 8080 }, { port: 9000, protocol: UDP }]
-  # headless: true  → DNS مستقیم به IP podها (برای StatefulSet)
-  # internal: true  → فقط داخل کلاستر
+  # headless: true   → DNS returns the pod IPs (for StatefulSets)
+  # internal: true   → reachable inside the cluster only
 ---
 kind: Volume
 metadata: { name: data }
-spec: { type: local, size: 10Gi }    # حجم اجباری
+spec: { type: local, size: 10Gi }   # size is enforced
 ```
 
-نمونه‌های کامل در `examples/`:
+Complete examples in [`examples/`](examples):
 
-| فایل | محتوا |
+| File | What it shows |
 |---|---|
-| `web.yaml` | وب‌سرور ساده با Service |
-| `redis.yaml` | Redis با volume |
-| `postgres.yaml` | Postgres با Secret و volume |
-| `api-autoscale.yaml` | API با autoscale و ConfigMap |
-| `sidecar.yaml` | init container و sidecar |
-| `statefulset.yaml` | Postgres در قالب StatefulSet |
-| `jobs.yaml` | Job و CronJob |
-| `ingress.yaml` | Ingress با host و path |
-| `udp.yaml` | سرویس UDP |
-| `nfs-volume.yaml` | volume از نوع NFS |
+| `web.yaml` | Replicated web server behind a service |
+| `redis.yaml` | Redis with a persistent volume |
+| `postgres.yaml` | PostgreSQL with a Secret and a volume |
+| `api-autoscale.yaml` | Autoscaled API with a ConfigMap |
+| `sidecar.yaml` | Init container and sidecar sharing localhost |
+| `statefulset.yaml` | PostgreSQL as a StatefulSet |
+| `jobs.yaml` | Job and CronJob |
+| `ingress.yaml` | Host and path routing with TLS |
+| `udp.yaml` | UDP service |
+| `nfs-volume.yaml` | NFS volume |
 
 ---
 
-## چطور کار می‌کند
+## How it works
 
-- **State و reconciliation:** کنترلرها هر ثانیه روی leader اجرا می‌شوند و وضعیت واقعی را به وضعیت مطلوب می‌رسانند.
-  کد: `internal/server/controllers.go` و `workloads.go`.
-- **Pod:** agent برای هر pod یک کانتینر pause می‌سازد که IP، پورت‌ها و DNS را نگه می‌دارد. بعد init containerها را به ترتیب
-  اجرا می‌کند و کانتینرهای اصلی را با `--network container:<pause>` به همان شبکه وصل می‌کند. image مربوط به pause از خود
-  باینری nube ساخته می‌شود و نیازی به registry ندارد. کد: `internal/agent/pod.go`.
-- **Volume با حجم ثابت:** هر volume یک فایل image با ext4 است که به‌صورت loop mount می‌شود. افزایش `size` باعث بزرگ‌شدن
-  آنلاین آن می‌شود و کوچک‌کردن مجاز نیست. کد: `internal/agent/volumes.go`.
-- **امنیت:** اولین leader یک CA می‌سازد که داخل state تکثیرشده نگه داشته می‌شود. هر سرور با آن برای خودش گواهی صادر می‌کند.
-  agentها CSR می‌فرستند و گواهی‌شان را با IP خودشان می‌گیرند. سرور با client certificate به agentها وصل می‌شود.
-  کد: `internal/pki` و `internal/server/auth.go`.
-- **HA:** هر تغییر state یک entry در لاگ Raft است. فقط leader کنترلرها را اجرا می‌کند. کد: `internal/store/raft.go`.
+- **State and reconciliation.** All objects live in one state. Every second the leader's controllers compare desired and
+  actual state and act on the difference — the core idea of Kubernetes. See `internal/server/controllers.go` and `workloads.go`.
+- **Agents.** Every 3 seconds an agent reports its node and pods and receives the pods it should run, its network peers and
+  the service routes. It drives Docker directly through the Engine API on the unix socket. See `internal/agent/`.
+- **Pods.** For each pod the agent starts a pause container that holds the IP, ports, DNS settings and hostname, runs the
+  init containers one by one, then starts the app containers with `--network container:<pause>`. The pause image is built
+  locally from the nube binary itself, so no registry access is needed. See `internal/agent/pod.go`.
+- **Sized volumes.** Each local volume with a size is an ext4 image file, loop-mounted. Raising `size` grows it online;
+  shrinking is refused. See `internal/agent/volumes.go`.
+- **Security.** The first leader creates a CA, stored in the replicated state. Each server issues itself a certificate from
+  it; agents send a CSR and get a certificate for their own IP; servers call agents with a client certificate.
+  See `internal/pki` and `internal/server/auth.go`.
+- **High availability.** Every state change is a Raft log entry holding a full snapshot of the state, which keeps the state
+  machine simple and deterministic. Only the leader runs controllers; followers forward writes to it.
+  See `internal/store/raft.go`.
+- **Networking.** Each node owns a Docker bridge network (`nube0`) with its own /24. WireGuard (`nube-wg`) routes pod
+  subnets between nodes without NAT; traffic to the internet is masqueraded. DNS and the service proxy listen on the
+  bridge gateway (`10.88.N.1`).
+- **Upgrades without downtime.** Pods keep running when the agent restarts (`KillMode=process`); the agent adopts them again.
 
-## محدودیت‌هایی که هنوز هست
+## Limitations
 
-- **DaemonSet**، **NetworkPolicy**، CRD و operator وجود ندارد.
-- Ingress گواهی Let's Encrypt را خودکار نمی‌گیرد. گواهی را (مثلاً با certbot) در یک Secret نوع `tls` بگذارید.
-- volume از نوع `local` به نودش وابسته است. حجم volumeهای `nfs` را سرور NFS مدیریت می‌کند. snapshot و backup خودکار ندارد.
-- runtime فقط Docker است.
-- در HA کل state در هر entry تکثیر می‌شود. این برای ده‌ها نود و صدها pod کافی است، نه برای هزاران.
-- گواهی‌ها self-signed هستند (CA خود کلاستر). برای دسترسی از اینترنت، داشبورد را پشت Ingress با گواهی معتبر بگذارید.
+- No DaemonSets, NetworkPolicies, CRDs or operators.
+- Ingress does not obtain Let's Encrypt certificates automatically — put one (e.g. from certbot) in a `tls` Secret.
+- `local` volumes are tied to their node; `nfs` volume sizes are managed by the NFS server; no snapshots or backups.
+- Docker is the only container runtime.
+- In HA mode the whole state is replicated with every change: fine for tens of nodes and hundreds of pods, not thousands.
+- Certificates come from the cluster's own CA. To expose the dashboard on the internet, put it behind an Ingress with a real certificate.
 
-## توسعه و تست
+## Development
 
 ```bash
-go test ./...          # scheduler، rolling update، Job، CronJob، StatefulSet، RBAC، Ingress، UDP proxy، PKI و ...
-make linux             # یا powershell -ExecutionPolicy Bypass -File .\build.ps1
-bash test/e2e/up.sh    # کلاستر تستی روی Docker: ۳ سرور HA با TLS و ۲ نود
+go test ./...          # scheduler, rolling updates, Jobs, CronJobs, StatefulSets, RBAC, Ingress, UDP proxy, PKI ...
+make linux             # or: powershell -ExecutionPolicy Bypass -File .\build.ps1
+bash test/e2e/up.sh    # local test cluster on Docker: 3 HA servers with TLS + 2 nodes
 ```
 
-## عیب‌یابی
+Project layout:
 
-| مشکل | راه‌حل |
+```
+cmd/nube/            main: server | agent | pause | CLI
+internal/api/        resource types, manifest parsing, quantities
+internal/store/      state, file store, Raft store
+internal/server/     API, auth, scheduler, controllers, load balancer, ingress, dashboard (web/)
+internal/agent/      Docker client, pods, networking, DNS, volumes
+internal/proxy/      TCP/UDP load balancer
+internal/pki/        cluster CA and pinned TLS
+internal/cli/        kubectl-style client
+deploy/              installer and systemd units
+test/e2e/            Docker-based multi-node test cluster
+```
+
+## Troubleshooting
+
+| Problem | Fix |
 |---|---|
-| `server certificate is not signed by the pinned cluster CA` | hash را با `/var/lib/nube/ca.hash` روی سرور مقایسه کنید |
-| نود `NotReady` است | `journalctl -u nube-agent -n 50`. آیا agent به پورت 7070 دسترسی دارد و توکن از نوع `node` است؟ |
-| ستون NETWORK مقدار `wireguard(down)` دارد | خطا در صفحه‌ی Nodes دیده می‌شود. معمولاً `wireguard-tools` نصب نیست یا UDP 51820 بسته است |
-| در وضعیت volume پیام `size not enforced` هست | `e2fsprogs` روی نود نیست، یا volume قبل از تعیین size ساخته شده |
-| pod در `Pending` یا `Init` مانده | `nube describe pod NAME` و `nube logs POD -c INIT_CONTAINER` |
-| `403 ... needs role edit` | توکن شما نقش کافی ندارد (`nube whoami`) |
+| `server certificate is not signed by the pinned cluster CA` | Compare the hash with `/var/lib/nube/ca.hash` on a server |
+| Node is `NotReady` | `journalctl -u nube-agent -n 50` — can the agent reach port 7070, and is its token a `node` token? |
+| NETWORK shows `wireguard(down)` | The Nodes page shows the error; usually `wireguard-tools` is missing or UDP 51820 is blocked |
+| Volume says `size not enforced` | `e2fsprogs` is missing on the node, or the volume existed before it had a size |
+| Pod stuck in `Pending` or `Init` | `nube describe pod NAME` and `nube logs POD -c INIT_CONTAINER` |
+| `403 ... needs role edit` | Your token's role is not enough (`nube whoami`) |
+| `ErrImagePull` | Check the image name and that Docker on the node can reach the registry |
