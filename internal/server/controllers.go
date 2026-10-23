@@ -26,7 +26,7 @@ const (
 func (s *Server) controllerLoop(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	var lastAutoscale time.Time
+	var lastAutoscale, lastSample time.Time
 	wasLeader := false
 	for {
 		select {
@@ -96,6 +96,16 @@ func (s *Server) controllerLoop(ctx context.Context) {
 		})
 		if err != nil && err != store.ErrNotLeader {
 			log.Printf("controllers: %v", err)
+		}
+		if time.Since(lastSample) >= time.Minute {
+			lastSample = time.Now()
+			s.store.Read(func(st *store.State) {
+				pods := make([]*api.Pod, 0, len(st.Pods))
+				for _, p := range st.Pods {
+					pods = append(pods, p)
+				}
+				s.live.sample(pods)
+			})
 		}
 	}
 }
@@ -204,6 +214,13 @@ func schedulePending(st *store.State, now time.Time) {
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].Metadata.CreatedAt.Before(pending[j].Metadata.CreatedAt) })
 	for _, p := range pending {
+		if wait := dependencyWait(st, p); wait != "" {
+			if p.Status.Message != wait {
+				p.Status.Message = wait
+				st.Event("Normal", api.KindPod, p.Metadata.Namespace, p.Metadata.Name, "WaitingForDependency", wait)
+			}
+			continue
+		}
 		node, reason := pickNode(st, p)
 		if node == nil {
 			if p.Status.Message != reason {
@@ -372,25 +389,43 @@ func newPodFor(d *api.Deployment, hash string, now time.Time) *api.Pod {
 // current template, doing a surge-based rolling update when the template changes.
 func reconcileDeployment(st *store.State, d *api.Deployment, now time.Time) {
 	ns, name := d.Metadata.Namespace, d.Metadata.Name
-	hash := d.Spec.Template.Hash()
+	config := configDigests(st, ns, &d.Spec.Template)
+	hash := rolloutHash(&d.Spec.Template, config)
 	if d.Status.CurrentHash != hash {
 		rev := 0
 		var hist []api.Revision
-		for _, h := range d.Status.History {
+		var cur *api.Revision
+		for i, h := range d.Status.History {
 			rev = max(rev, h.Revision)
+			if h.Hash == d.Status.CurrentHash {
+				cur = &d.Status.History[i]
+			}
 			if h.Hash != hash {
 				hist = append(hist, h)
 			}
 		}
 		rev++
-		hist = append(hist, api.Revision{Revision: rev, Hash: hash, Template: deepCopy(d.Spec.Template), CreatedAt: now})
+		cause := "created"
+		if cur != nil {
+			cause = rolloutCause(&cur.Template, cur.Config, &d.Spec.Template, config)
+		}
+		if d.Status.RollingBack {
+			cause = "automatic rollback"
+		}
+		hist = append(hist, api.Revision{Revision: rev, Hash: hash, Template: deepCopy(d.Spec.Template), CreatedAt: now, Config: config, Cause: cause})
 		if len(hist) > maxHistory {
 			hist = hist[len(hist)-maxHistory:]
 		}
 		first := d.Status.CurrentHash == ""
 		d.Status.History, d.Status.Revision, d.Status.CurrentHash = hist, rev, hash
+		// A rollback is never rolled back itself.
+		d.Status.RolloutStartedAt = time.Time{}
+		if !first && !d.Status.RollingBack {
+			d.Status.RolloutStartedAt = now
+		}
+		d.Status.RollingBack = false
 		if !first {
-			st.Event("Normal", api.KindDeployment, ns, name, "RolloutStarted", fmt.Sprintf("rolling out revision %d (%s)", rev, d.Spec.Template.MainImage()))
+			st.Event("Normal", api.KindDeployment, ns, name, "RolloutStarted", fmt.Sprintf("rolling out revision %d: %s", rev, cause))
 		}
 	}
 
@@ -465,6 +500,8 @@ func reconcileDeployment(st *store.State, d *api.Deployment, now time.Time) {
 		}
 	}
 
+	autoRollback(st, d, newPods, now)
+
 	readyNew, readyOld := countReady(newPods), countReady(oldPods)
 	stat := &d.Status
 	stat.Replicas = len(newPods) + len(oldPods)
@@ -474,8 +511,14 @@ func reconcileDeployment(st *store.State, d *api.Deployment, now time.Time) {
 	prev := stat.Phase
 	troubled := ""
 	for _, p := range append(append([]*api.Pod{}, newPods...), oldPods...) {
-		if p.Status.Phase == api.PodCrashLoop || p.Status.Phase == api.PodFailed || (p.Status.Message != "" && !p.Status.Ready) {
-			troubled = p.Metadata.Name + ": " + firstNonEmpty(p.Status.Message, string(p.Status.Phase))
+		// Broken, or impossible to schedule; pulling an image or waiting for a
+		// dependency is progress, not trouble.
+		if r := failing(p); r != "" {
+			troubled = p.Metadata.Name + ": " + r
+			break
+		}
+		if p.Spec.NodeName == "" && p.Status.Message != "" && !strings.HasPrefix(p.Status.Message, "waiting for service") {
+			troubled = p.Metadata.Name + ": " + p.Status.Message
 			break
 		}
 	}
@@ -484,6 +527,7 @@ func reconcileDeployment(st *store.State, d *api.Deployment, now time.Time) {
 		stat.Phase, stat.Message = "Paused", "rollout paused"
 	case readyNew == desired && len(oldPods) == 0 && len(newPods) == desired:
 		stat.Phase, stat.Message = "Healthy", ""
+		stat.RolloutStartedAt = time.Time{}
 	case troubled != "":
 		stat.Phase, stat.Message = "Degraded", troubled
 	default:

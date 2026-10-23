@@ -41,10 +41,13 @@ type State struct {
 	Servers      map[string]*api.ServerMember             `json:"servers"`
 	// Cluster certificate authority (PEM), created once by the first leader.
 	// It signs every server and agent certificate; clients pin its hash.
-	CACert   string      `json:"caCert,omitempty"`
-	CAKey    string      `json:"caKey,omitempty"`
-	Events   []api.Event `json:"events"`
-	EventSeq int64       `json:"eventSeq"`
+	CACert string `json:"caCert,omitempty"`
+	CAKey  string `json:"caKey,omitempty"`
+	// ConfigKey keys the digests of ConfigMap/Secret contents kept in
+	// workload history, so they reveal nothing about secret values.
+	ConfigKey []byte      `json:"configKey,omitempty"`
+	Events    []api.Event `json:"events"`
+	EventSeq  int64       `json:"eventSeq"`
 }
 
 func NewState() *State {

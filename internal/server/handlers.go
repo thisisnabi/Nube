@@ -142,6 +142,21 @@ func visible[T any](id *api.Identity, list []T, ns func(T) string) []T {
 	return out
 }
 
+// forwardLiveRead sends reads of kinds that carry live usage (kept in the
+// leader's memory) to the leader. It reports whether it handled the request.
+func (s *Server) forwardLiveRead(w http.ResponseWriter, r *http.Request, kind string) bool {
+	switch kind {
+	case api.KindNode, api.KindPod, api.KindVolume, api.KindDeployment, api.KindStatefulSet, api.KindDaemonSet:
+	default:
+		return false
+	}
+	if s.store.IsLeader() || s.store.LeaderAPI() == "" || r.Header.Get("X-Nube-Forwarded") != "" {
+		return false
+	}
+	s.forwardToLeader(w, r)
+	return true
+}
+
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	// Usage metrics live in the leader's memory: ask it.
 	if !s.store.IsLeader() && s.store.LeaderAPI() != "" && r.Header.Get("X-Nube-Forwarded") == "" {
@@ -178,6 +193,15 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ov.DaemonSets = visible(id, sortedValues(st.DaemonSets, func(v *api.DaemonSet) string { return v.Metadata.Key() }), func(d *api.DaemonSet) string { return d.Metadata.Namespace })
+		for i, d := range ov.Deployments {
+			ov.Deployments[i] = s.present(api.KindDeployment, d, false).(*api.Deployment)
+		}
+		for i, d := range ov.StatefulSets {
+			ov.StatefulSets[i] = s.present(api.KindStatefulSet, d, false).(*api.StatefulSet)
+		}
+		for i, d := range ov.DaemonSets {
+			ov.DaemonSets[i] = s.present(api.KindDaemonSet, d, false).(*api.DaemonSet)
+		}
 		ov.Policies = visible(id, sortedValues(st.Policies, func(v *api.NetworkPolicy) string { return v.Metadata.Key() }), func(d *api.NetworkPolicy) string { return d.Metadata.Namespace })
 		ov.Snapshots = visible(id, sortedValues(st.Snapshots, func(v *api.VolumeSnapshot) string { return v.Metadata.Key() }), func(d *api.VolumeSnapshot) string { return d.Metadata.Namespace })
 		ov.CRDs = sortedValues(st.CRDs, func(v *api.CustomResourceDefinition) string { return v.Spec.Kind })
@@ -291,6 +315,18 @@ func (s *Server) present(kind string, v any, reveal bool) any {
 		if !reveal {
 			return maskSecret(o)
 		}
+	case *api.Deployment:
+		c := *o
+		c.Status.Recommendation = s.live.recommend(api.KindDeployment, o.Metadata.Namespace, o.Metadata.Name, &o.Spec.Template)
+		return &c
+	case *api.StatefulSet:
+		c := *o
+		c.Status.Recommendation = s.live.recommend(api.KindStatefulSet, o.Metadata.Namespace, o.Metadata.Name, &o.Spec.Template)
+		return &c
+	case *api.DaemonSet:
+		c := *o
+		c.Status.Recommendation = s.live.recommend(api.KindDaemonSet, o.Metadata.Namespace, o.Metadata.Name, &o.Spec.Template)
+		return &c
 	case *api.Service:
 		return s.lb.decorate([]*api.Service{o})[0]
 	case *api.Ingress:
@@ -302,6 +338,9 @@ func (s *Server) present(kind string, v any, reveal bool) any {
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind, ns string) {
 	if kind == "" || kind == api.KindToken {
 		writeErr(w, 404, "unknown resource type "+r.PathValue("kind"))
+		return
+	}
+	if s.forwardLiveRead(w, r, kind) {
 		return
 	}
 	id := identityFrom(r)
@@ -327,6 +366,9 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind, ns str
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, kind, ns, name string) {
+	if s.forwardLiveRead(w, r, kind) {
+		return
+	}
 	reveal := r.URL.Query().Get("reveal") == "1"
 	s.readJSON(w, func(st *store.State) (int, any) {
 		var v any

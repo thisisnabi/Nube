@@ -29,7 +29,7 @@ together, and survives the loss of a node or a control-plane server.
 | Area | What you get |
 |---|---|
 | **Pods** | Multiple containers sharing `localhost` (a pause container owns the network, like Kubernetes), init containers that run in order, shared `emptyDir` scratch volumes on disk or in memory with size limits |
-| **Workloads** | `Deployment` with rolling updates, rollback, pause/resume and CPU autoscaling · `StatefulSet` with stable names (`db-0`, `db-1`), ordered start-up, a volume per replica and per-pod DNS · `DaemonSet` with one pod per (selected) node and rolling updates · `Job` with completions, parallelism, backoff limit and deadline · `CronJob` with cron schedules, time zones and concurrency policy |
+| **Workloads** | `Deployment` with rolling updates, **automatic rollback of failed rollouts**, pause/resume and CPU autoscaling · pods **roll automatically when a ConfigMap or Secret they use changes** · start-up ordering with `dependsOn` · `StatefulSet` with stable names (`db-0`, `db-1`), ordered start-up, a volume per replica and per-pod DNS · `DaemonSet` with one pod per (selected) node and rolling updates · `Job` with completions, parallelism, backoff limit and deadline · `CronJob` with cron schedules, time zones and concurrency policy |
 | **Scheduler** | Filters on readiness, cordoning, `nodeSelector`, CPU/memory requests, host ports and volume location; spreads replicas across nodes |
 | **Self-healing** | Per-container restart with exponential back-off (CrashLoopBackOff), HTTP and TCP health checks, rescheduling when a node is lost |
 | **Networking** | A pod subnet per node, an encrypted **WireGuard** overlay (or host-gw), direct pod-to-pod traffic |
@@ -43,9 +43,30 @@ together, and survives the loss of a node or a control-plane server.
 | **Security** | **HTTPS API** with a cluster CA that clients pin by hash (or a Let's Encrypt or your own certificate for the dashboard), **mutual TLS** between servers and agents, **role-based tokens** (`admin`, `edit`, `view`, `node`) optionally scoped to namespaces, masked secret values |
 | **High availability** | 3 or 5 servers replicated with **Raft**, which ships only what changed in each write; a new leader is elected within seconds and agents fail over automatically |
 | **Runtimes** | Docker or Podman (through its Docker-compatible API), chosen per node |
-| **Observability** | Live dashboard, events, streaming logs per container, CPU/memory/disk usage, `nube top` |
+| **Observability** | Live dashboard, events, streaming logs per container, CPU/memory/disk usage, `nube top`, **CPU/memory request recommendations** from observed usage |
 
-### What has actually been tested
+## What you get that Kubernetes leaves to add-ons
+
+Kubernetes is far more mature and has a huge ecosystem. But a lot of what people need day to day is not in Kubernetes
+itself: you find, install, configure and upgrade a separate project for each. In Nube these are part of the one binary.
+
+| Everyday problem | In Kubernetes | In Nube |
+|---|---|---|
+| A ConfigMap or Secret changes, but running pods keep the old values until something restarts them | Install Reloader, or add a hash annotation by hand | Built in: the workload rolls its pods one by one; history says `configmap/app changed` |
+| A rollout's new pods crash or the image does not exist | The rollout just stops; `progressDeadlineSeconds` only marks it failed and you run `kubectl rollout undo` | Built in: after `progressDeadlineSeconds` the previous revision comes back automatically, without downtime, and an event says why |
+| The API must wait for the database | No ordering; people write init containers with wait loops | `dependsOn: [db]`: the pod waits until the `db` service has a ready pod |
+| What should my CPU/memory requests be? | Install the Vertical Pod Autoscaler | `nube top workloads` and the dashboard compare requests with observed usage and suggest values |
+| HTTPS certificates | Install cert-manager | `acme: true` on an Ingress |
+| Volume backups, restore, moving data to another node | Install Velero and a CSI snapshot controller | Built in: snapshots, scheduled backups, `restoreFrom`, `nube volume move`, `autoRecover` |
+| A local volume's size is not enforced | `hostPath` and local PVs have no quota | Each local volume is its own filesystem: writes stop at its size |
+| Ingress and a load balancer on bare metal | Install an ingress controller and MetalLB | Built in on every server |
+| Network policies | Only with a CNI that supports them (Calico, Cilium ...) | Built in |
+| Running the control plane | etcd plus several components, certificates to manage | One binary; Raft and the cluster CA are built in |
+
+Where Kubernetes is the better choice: big clusters, `kubectl`/Helm/operator ecosystem compatibility, managed offerings,
+and anything that needs a certified, battle-tested platform.
+
+## What has actually been tested
 
 On a Docker test cluster (3 HA servers with TLS + Docker-in-Docker and Podman nodes with WireGuard) and on a fresh Ubuntu 24.04 install:
 
@@ -64,7 +85,10 @@ On a Docker test cluster (3 HA servers with TLS + Docker-in-Docker and Podman no
 - snapshots were replicated to all three servers and downloaded; a volume moved to another node, and another recovered after its node was lost, with their data;
 - an NFS `ReadWriteOnce` volume enforced its size and followed its pod to another node;
 - with a test ACME CA (Pebble), every server served the issued certificates for the API and Ingress hosts, and after the leader was stopped the new leader issued a certificate for a new host;
-- on a Podman node, multi-container pods, DNS, services, sized volumes and snapshots worked.
+- on a Podman node, multi-container pods, DNS, services, sized volumes and snapshots worked;
+- on two Podman nodes: changing a ConfigMap rolled the pods and the service answered with the new value; a client with
+  `dependsOn: [db]` waited until db was ready; a rollout to an image that does not exist kept the old pods serving and was
+  rolled back automatically after its 40-second deadline.
 
 ---
 
@@ -175,7 +199,7 @@ nube suspend|resume cronjob NAME
 nube token create ci --role edit -n prod                 # the secret is shown once
 nube token list | nube token delete ci
 nube whoami
-nube top nodes|pods
+nube top nodes|pods|workloads                            # workloads: requests vs. recommended
 nube cordon|uncordon|drain NODE
 nube label node NAME key=value
 nube events -w
@@ -202,7 +226,11 @@ spec:
   replicas: 3
   strategy: { maxSurge: 1, maxUnavailable: 0 }
   autoscale: { min: 2, max: 10, targetCPUPercent: 70 }
+  progressDeadlineSeconds: 600   # failing new pods after this long → automatic rollback
+  # autoRollback: false          # only report it
   template:
+    dependsOn: [db]              # schedule only once service db has a ready pod
+    # reloadOnConfigChange: false   # do not roll pods when their ConfigMaps/Secrets change
     # One container: put image, command, ports ... directly here.
     # Several containers:
     emptyDirs: [{ name: cache, sizeLimit: 256Mi, medium: Memory }]
@@ -299,6 +327,14 @@ Complete examples in [`examples/`](examples):
   (`NUBE-SERVICES`); network policies are per-pod iptables chains. DNS listens on the bridge gateway (`10.244.N.1`).
 - **Snapshots.** An agent tars a volume and uploads it to the servers, which replicate it among themselves; a restore
   streams it back into a fresh volume on the target node. Moves and recoveries are a snapshot plus a restore.
+- **Configuration-aware rollouts.** A workload's revision is its template plus a keyed digest (HMAC) of the ConfigMaps
+  and Secrets it reads, so a data change starts a normal rolling update, and the history does not reveal secret values.
+- **Automatic rollback.** If a new revision's pods are failing (crash loop, image pull error, failing health check,
+  missing ConfigMap) when `progressDeadlineSeconds` runs out, the controller puts the previous template back. Pods that
+  are only waiting (scheduling, pulling, `dependsOn`) never trigger it, and a rollback is never rolled back itself.
+  See `internal/server/rollout.go`.
+- **Recommendations.** Once a minute the leader records the highest per-pod usage of every workload (one day, in memory).
+  CPU is suggested at the 95th percentile + 15%, memory at the peak + 20%, because memory is also the container's limit.
 - **Custom resources.** A CRD adds a kind to the API, with a JSON-schema subset for validation and defaults. Operators use
   `watch` (long polling on resource versions) and write `status`; objects labelled `nube/owned-by=Kind/name` are deleted
   with their owner. See `internal/server/crd.go` and `examples/operator`.

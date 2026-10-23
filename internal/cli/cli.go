@@ -113,7 +113,7 @@ Client:
   nube rollout restart|undo|history|status|pause|resume deploy|sts NAME [--to-revision N]
   nube trigger cronjob NAME           run a cronjob now
   nube suspend|resume cronjob NAME
-  nube top nodes|pods
+  nube top nodes|pods|workloads          workloads: requests vs. recommended
   nube cordon|uncordon|drain NODE
   nube label node NAME key=value key-
   nube events [-n NS] [-w]
@@ -982,6 +982,9 @@ func cmdRollout(c *client, a args, rest []string) error {
 		if d.Status.Message != "" {
 			fmt.Println("  " + d.Status.Message)
 		}
+		if d.Status.LastRollback != "" {
+			fmt.Println("  last automatic rollback: " + d.Status.LastRollback)
+		}
 		return nil
 	case "history":
 		var d api.Deployment
@@ -989,13 +992,13 @@ func cmdRollout(c *client, a args, rest []string) error {
 			return err
 		}
 		w := newTab()
-		fmt.Fprintln(w, "REVISION\tIMAGE\tCREATED\tCURRENT")
+		fmt.Fprintln(w, "REVISION\tIMAGE\tCAUSE\tCREATED\tCURRENT")
 		for _, h := range d.Status.History {
 			cur := ""
 			if h.Hash == d.Status.CurrentHash {
 				cur = "*"
 			}
-			fmt.Fprintf(w, "%d\t%s\t%s ago\t%s\n", h.Revision, h.Template.MainImage(), age(h.CreatedAt), cur)
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s ago\t%s\n", h.Revision, h.Template.MainImage(), firstNonEmpty(h.Cause, "-"), age(h.CreatedAt), cur)
 		}
 		return w.Flush()
 	}
@@ -1068,6 +1071,29 @@ func cmdTop(c *client, a args, rest []string) error {
 				continue
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%dMi\n", p.Metadata.Namespace, p.Metadata.Name, p.Spec.NodeName, p.Status.CPU, p.Status.Memory)
+		}
+		return nil
+	}
+	if len(rest) > 0 && (rest[0] == "workloads" || rest[0] == "workload" || rest[0] == "wl") {
+		fmt.Fprintln(w, "NAMESPACE\tWORKLOAD\tREQUESTS (cpu/mem per pod)\tRECOMMENDED\tNOTE")
+		row := func(kind string, m api.Meta, rec *api.Recommendation) {
+			if rec == nil || a.flags["all-namespaces"] == "" && m.Namespace != a.ns() {
+				return
+			}
+			want := "-"
+			if rec.CPU > 0 {
+				want = fmt.Sprintf("%dm / %dMi", rec.CPU, rec.Memory)
+			}
+			fmt.Fprintf(w, "%s\t%s/%s\t%dm / %dMi\t%s\t%s\n", m.Namespace, kind, m.Name, rec.Requests.CPU, rec.Requests.Memory, want, rec.Message)
+		}
+		for _, d := range ov.Deployments {
+			row("deploy", d.Metadata, d.Status.Recommendation)
+		}
+		for _, d := range ov.StatefulSets {
+			row("sts", d.Metadata, d.Status.Recommendation)
+		}
+		for _, d := range ov.DaemonSets {
+			row("ds", d.Metadata, d.Status.Recommendation)
 		}
 		return nil
 	}

@@ -192,6 +192,46 @@ func fingerprint(cfg api.NetworkConfig) string {
 
 // ensureBridge creates (or recreates, if the subnet changed) the pod network.
 func (n *network) ensureBridge(ctx context.Context, subnet, gateway string) error {
+	if err := n.ensureRuntimeNetwork(ctx, subnet, gateway); err != nil {
+		return err
+	}
+	if n.docker.Podman {
+		return linuxBridge(subnet, gateway)
+	}
+	return nil
+}
+
+// linuxBridge makes sure the bridge device exists with the gateway address.
+// Docker creates it with the network; Podman only when the first container
+// starts, and until then routes to other nodes (src = gateway) and the
+// cluster DNS cannot be set up. Podman uses a bridge that already exists.
+func linuxBridge(subnet, gateway string) error {
+	_, ipnet, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return err
+	}
+	ones, _ := ipnet.Mask.Size()
+	addr := fmt.Sprintf("%s/%d", gateway, ones)
+	if _, err := net.InterfaceByName(bridgeName); err != nil {
+		if _, err := run("ip", "link", "add", bridgeName, "type", "bridge"); err != nil {
+			return err
+		}
+	}
+	out, err := run("ip", "-4", "-o", "addr", "show", "dev", bridgeName)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(out, " "+addr+" ") {
+		run("ip", "-4", "addr", "flush", "dev", bridgeName) // an old subnet
+		if _, err := run("ip", "addr", "add", addr, "dev", bridgeName); err != nil {
+			return err
+		}
+	}
+	_, err = run("ip", "link", "set", bridgeName, "up")
+	return err
+}
+
+func (n *network) ensureRuntimeNetwork(ctx context.Context, subnet, gateway string) error {
 	info, err := n.docker.InspectNetwork(ctx, networkName)
 	if err != nil {
 		return err

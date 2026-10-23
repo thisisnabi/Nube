@@ -169,6 +169,12 @@ type PodTemplate struct {
 	EmptyDirs      []EmptyDir        `json:"emptyDirs,omitempty"`
 	RestartPolicy  string            `json:"restartPolicy,omitempty"` // Always | OnFailure | Never
 	Annotations    map[string]string `json:"annotations,omitempty"`
+	// DependsOn lists services (name, or name.namespace) that must have a
+	// ready endpoint before this pod is scheduled.
+	DependsOn []string `json:"dependsOn,omitempty"`
+	// ReloadOnConfigChange (default true) rolls the pods of a Deployment,
+	// StatefulSet or DaemonSet when a ConfigMap or Secret they read changes.
+	ReloadOnConfigChange *bool `json:"reloadOnConfigChange,omitempty"`
 }
 
 // AllContainers returns the app containers, turning the inline shorthand into
@@ -228,7 +234,13 @@ type DeploymentSpec struct {
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 	Autoscale    *Autoscale        `json:"autoscale,omitempty"`
 	Paused       bool              `json:"paused,omitempty"`
-	Template     PodTemplate       `json:"template"`
+	// ProgressDeadlineSeconds: how long a rollout's new pods may keep failing
+	// before it is rolled back (default 600).
+	ProgressDeadlineSeconds int `json:"progressDeadlineSeconds,omitempty"`
+	// AutoRollback (default true) returns to the previous revision when a
+	// rollout's new pods keep failing past the progress deadline.
+	AutoRollback *bool       `json:"autoRollback,omitempty"`
+	Template     PodTemplate `json:"template"`
 }
 
 type Revision struct {
@@ -236,6 +248,10 @@ type Revision struct {
 	Hash      string      `json:"hash"`
 	Template  PodTemplate `json:"template"`
 	CreatedAt time.Time   `json:"createdAt"`
+	// Config holds a keyed digest of each ConfigMap/Secret the revision read
+	// ("configmap/NAME" -> digest), to tell which one changed.
+	Config map[string]string `json:"config,omitempty"`
+	Cause  string            `json:"cause,omitempty"` // why this revision was created
 }
 
 type DeploymentStatus struct {
@@ -250,6 +266,21 @@ type DeploymentStatus struct {
 	History           []Revision `json:"history,omitempty"`
 	LastScaleTime     time.Time  `json:"lastScaleTime,omitempty"`
 	CPUPercent        int        `json:"cpuPercent"`
+	// RolloutStartedAt is set while a rollout that may be rolled back is in progress.
+	RolloutStartedAt time.Time `json:"rolloutStartedAt,omitempty"`
+	RollingBack      bool      `json:"rollingBack,omitempty"`  // the current rollout is an automatic rollback
+	LastRollback     string    `json:"lastRollback,omitempty"` // what was rolled back, and why
+	// Recommendation is computed from observed usage (not stored).
+	Recommendation *Recommendation `json:"recommendation,omitempty"`
+}
+
+// Recommendation suggests per-pod resource requests from observed usage.
+type Recommendation struct {
+	CPU      int64     `json:"cpu"`      // millicores
+	Memory   int64     `json:"memory"`   // MiB
+	Requests Resources `json:"requests"` // what the template asks for now, per pod
+	Minutes  int       `json:"minutes"`  // minutes of data behind it
+	Message  string    `json:"message,omitempty"`
 }
 
 type Deployment struct {
@@ -540,6 +571,8 @@ type StatefulSetStatus struct {
 	Revision        int    `json:"revision"`
 	Phase           string `json:"phase"` // Healthy | Progressing | Degraded
 	Message         string `json:"message,omitempty"`
+	// Recommendation is computed from observed usage (not stored).
+	Recommendation *Recommendation `json:"recommendation,omitempty"`
 }
 
 type StatefulSet struct {

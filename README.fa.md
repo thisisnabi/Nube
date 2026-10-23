@@ -24,7 +24,7 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
 | حوزه | چه چیزی پیاده شده |
 |---|---|
 | **Pod** | چند کانتینر در هر pod که `localhost` مشترک دارند (مثل Kubernetes، با یک کانتینر pause که صاحب شبکه است)، init container که به ترتیب اجرا می‌شود، و `emptyDir` مشترک (روی دیسک یا حافظه، با محدودیت حجم) |
-| **Workloads** | `Deployment` با rolling update، rollback و autoscale. `StatefulSet` با نام‌های پایدار (`db-0`، `db-1`)، شروع مرتب، یک volume برای هر replica و DNS برای هر pod. `DaemonSet` با یک pod روی هر نود (یا نودهای انتخاب‌شده) و rolling update. `Job` با completions، parallelism، backoffLimit و deadline. `CronJob` با زمان‌بندی cron و time zone و concurrencyPolicy |
+| **Workloads** | `Deployment` با rolling update، **rollback خودکار rolloutهای ناموفق** و autoscale. **با تغییر ConfigMap یا Secret، podها خودکار rolling restart می‌شوند.** ترتیب شروع با `dependsOn`. `StatefulSet` با نام‌های پایدار (`db-0`، `db-1`)، شروع مرتب، یک volume برای هر replica و DNS برای هر pod. `DaemonSet` با یک pod روی هر نود (یا نودهای انتخاب‌شده) و rolling update. `Job` با completions، parallelism، backoffLimit و deadline. `CronJob` با زمان‌بندی cron و time zone و concurrencyPolicy |
 | **Scheduler** | فیلتر بر اساس Ready/cordon، `nodeSelector`، CPU/RAM درخواستی، host port و محل volume. پخش replicaها روی نودهای مختلف |
 | **Self-healing** | restart با backoff نمایی برای هر کانتینر، health check از نوع HTTP و TCP، جابه‌جایی podها وقتی نودی از دست می‌رود |
 | **Networking** | subnet جداگانه برای هر نود، overlay رمزنگاری‌شده با **WireGuard** (یا host-gw)، ارتباط مستقیم pod به pod |
@@ -38,9 +38,30 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
 | **امنیت** | **API روی HTTPS** با CA اختصاصی کلاستر (کلاینت‌ها hash آن را pin می‌کنند) یا گواهی Let's Encrypt یا گواهی خودتان برای داشبورد، **mutual TLS** بین سرور و agentها، **توکن‌های چندگانه با نقش** (`admin`، `edit`، `view`، `node`) و محدودسازی به namespace، و ماسک‌شدن مقدار secretها |
 | **High availability** | ۳ (یا ۵) سرور با **Raft** که در هر تغییر فقط همان بخش تغییرکرده را تکثیر می‌کند. در صورت از کار افتادن leader، ظرف چند ثانیه leader جدید انتخاب می‌شود. agentها خودکار به سرور سالم سوییچ می‌کنند |
 | **Runtime** | Docker یا Podman (از طریق API سازگار با Docker)، برای هر نود جداگانه |
-| **Observability** | داشبورد زنده، رویدادها، لاگ زنده‌ی هر کانتینر (`logs -c`)، مصرف CPU، RAM و دیسک |
+| **Observability** | داشبورد زنده، رویدادها، لاگ زنده‌ی هر کانتینر (`logs -c`)، مصرف CPU، RAM و دیسک، و **پیشنهاد مقدار درخواست CPU/RAM** بر اساس مصرف واقعی |
 
-### چه چیزهایی واقعاً تست شده
+## چیزهایی که Kubernetes به add-on واگذار کرده
+
+Kubernetes خیلی پخته‌تر است و اکوسیستم بزرگی دارد. اما خیلی از نیازهای روزمره داخل خود Kubernetes نیست و برای هرکدام
+باید یک پروژه‌ی جدا پیدا، نصب، تنظیم و به‌روز کرد. در Nube این‌ها بخشی از همان یک باینری هستند.
+
+| مشکل روزمره | در Kubernetes | در Nube |
+|---|---|---|
+| ConfigMap یا Secret عوض می‌شود ولی podهای در حال اجرا تا restart بعدی مقدار قدیمی را دارند | نصب Reloader یا annotation دستی | داخلی: podها یکی‌یکی جایگزین می‌شوند و در history نوشته می‌شود `configmap/app changed` |
+| podهای جدید یک rollout کرش می‌کنند یا image وجود ندارد | rollout فقط متوقف می‌شود؛ `progressDeadlineSeconds` فقط آن را failed علامت می‌زند و باید دستی `kubectl rollout undo` زد | داخلی: بعد از `progressDeadlineSeconds` نسخه‌ی قبلی خودکار و بدون قطعی برمی‌گردد و یک event دلیلش را می‌گوید |
+| API باید منتظر دیتابیس بماند | ترتیبی وجود ندارد؛ معمولاً init container با حلقه‌ی انتظار می‌نویسند | `dependsOn: [db]`: pod صبر می‌کند تا سرویس `db` یک pod آماده داشته باشد |
+| مقدار درخواست CPU/RAM چقدر باشد؟ | نصب Vertical Pod Autoscaler | `nube top workloads` و داشبورد درخواست‌ها را با مصرف واقعی مقایسه و مقدار پیشنهاد می‌کنند |
+| گواهی HTTPS | نصب cert-manager | `acme: true` روی Ingress |
+| backup، restore و انتقال داده‌ی volume به نود دیگر | نصب Velero و CSI snapshot controller | داخلی: snapshot، backup زمان‌بندی‌شده، `restoreFrom`، `nube volume move` و `autoRecover` |
+| حجم volume محلی اعمال نمی‌شود | `hostPath` و local PV سهمیه ندارند | هر volume محلی فایل‌سیستم خودش را دارد و بیشتر از اندازه‌اش نمی‌شود نوشت |
+| Ingress و load balancer روی سرور فیزیکی | نصب ingress controller و MetalLB | داخلی، روی همه‌ی سرورها |
+| NetworkPolicy | فقط با CNI‌ای که پشتیبانی کند (Calico، Cilium و ...) | داخلی |
+| اجرای control plane | etcd و چند جزء دیگر، و مدیریت گواهی‌ها | یک باینری؛ Raft و CA کلاستر داخلش هستند |
+
+جاهایی که Kubernetes انتخاب بهتری است: کلاسترهای بزرگ، سازگاری با `kubectl`، Helm و operatorهای موجود، سرویس‌های
+managed، و هر جا که یک پلتفرم استاندارد و آزموده لازم است.
+
+## چه چیزهایی واقعاً تست شده
 روی یک کلاستر Docker با ۳ سرور HA (با TLS) و نودهای Docker-in-Docker و Podman (با WireGuard)، و یک نصب تمیز روی Ubuntu 24.04:
 
 - **Pod چندکانتینری:** init container صفحه را نوشت، nginx سرو کرد، و sidecar از طریق `localhost` به آن رسید.
@@ -58,6 +79,8 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
 - **NFS:** volume از نوع `ReadWriteOnce` حجمش را رعایت کرد و همراه pod به نود دیگر رفت.
 - **Let's Encrypt:** با یک CA تستی ACME ‏(Pebble)، همه‌ی سرورها گواهی صادرشده را برای API و Ingress سرو کردند. بعد از توقف leader، leader جدید برای یک host تازه گواهی گرفت.
 - **Podman:** روی یک نود Podman، pod چندکانتینری، DNS، سرویس‌ها، volume با حجم اجباری و snapshot کار کردند.
+- **Rollout هوشمند:** روی دو نود Podman، تغییر ConfigMap باعث rolling restart شد و سرویس مقدار جدید را برگرداند؛ کلاینتی با
+  `dependsOn: [db]` تا آماده‌شدن db صبر کرد؛ rollout به imageای که وجود نداشت podهای قدیمی را نگه داشت و بعد از ۴۰ ثانیه خودکار rollback شد.
 
 ---
 
@@ -151,7 +174,7 @@ nube suspend|resume cronjob NAME
 nube token create ci --role edit -n prod       # فقط یک بار نشان داده می‌شود
 nube token list | nube token delete ci
 nube whoami
-nube top nodes|pods
+nube top nodes|pods|workloads      # workloads: درخواست‌ها در برابر مقدار پیشنهادی
 nube cordon|uncordon|drain NODE
 nube cluster status
 ```
@@ -173,7 +196,11 @@ kind: Deployment            # یا StatefulSet / DaemonSet / Job / Pod
 metadata: { name: app, namespace: default }
 spec:
   replicas: 3
+  progressDeadlineSeconds: 600   # اگر podهای جدید بعد از این مدت هنوز خراب باشند → rollback خودکار
+  # autoRollback: false          # فقط گزارش بده
   template:
+    dependsOn: [db]              # فقط وقتی سرویس db یک pod آماده دارد schedule شود
+    # reloadOnConfigChange: false   # با تغییر ConfigMap/Secret، podها را عوض نکن
     # یک کانتینر: فیلدها مستقیم اینجا (image, command, ports, ...)
     # چند کانتینر:
     emptyDirs: [{ name: cache, sizeLimit: 256Mi, medium: Memory }]
@@ -267,6 +294,13 @@ spec:
   gateway شبکه (`10.244.N.1`) گوش می‌دهد.
 - **Snapshot:** agent از volume یک tar می‌سازد و روی سرورها آپلود می‌کند و سرورها آن را بین خودشان تکثیر می‌کنند. بازیابی آن را در
   یک volume تازه روی نود مقصد باز می‌کند. انتقال و بازیابی خودکار هم همان snapshot و restore است.
+- **Rollout آگاه از تنظیمات:** revision هر workload از template و یک digest کلیددار (HMAC) از ConfigMapها و Secretهایی که
+  می‌خواند ساخته می‌شود؛ پس تغییر داده یک rolling update عادی شروع می‌کند و history چیزی از مقدار secretها لو نمی‌دهد.
+- **Rollback خودکار:** اگر وقتی `progressDeadlineSeconds` تمام می‌شود podهای revision جدید خراب باشند (crash loop، خطای pull،
+  health check ناموفق، ConfigMap ناموجود)، کنترلر template قبلی را برمی‌گرداند. podهایی که فقط منتظرند (schedule، pull، `dependsOn`)
+  باعث rollback نمی‌شوند و خود rollback هیچ‌وقت rollback نمی‌شود. کد: `internal/server/rollout.go`.
+- **پیشنهاد منابع:** leader هر دقیقه بیشترین مصرف هر pod از هر workload را ثبت می‌کند (یک روز، در حافظه). CPU با صدک ۹۵ به‌علاوه‌ی ۱۵٪
+  و RAM با بیشینه به‌علاوه‌ی ۲۰٪ پیشنهاد می‌شود، چون RAM سقف کانتینر هم هست.
 - **CRD:** یک CRD نوع جدیدی به API اضافه می‌کند، با زیرمجموعه‌ای از JSON schema برای اعتبارسنجی و مقدار پیش‌فرض. operatorها از
   `watch` استفاده می‌کنند و `status` را می‌نویسند. شیءهایی که label ‏`nube/owned-by=Kind/name` دارند همراه صاحبشان حذف می‌شوند.
 

@@ -462,10 +462,10 @@ func ordinalOf(set, pod string) (int, bool) {
 // highest ordinal down one pod at a time.
 func reconcileStatefulSet(st *store.State, ss *api.StatefulSet, now time.Time) {
 	ns, name := ss.Metadata.Namespace, ss.Metadata.Name
-	hash := ss.Spec.Template.Hash()
+	hash := rolloutHash(&ss.Spec.Template, configDigests(st, ns, &ss.Spec.Template))
 	if ss.Status.CurrentHash != hash {
 		if ss.Status.CurrentHash != "" {
-			st.Event("Normal", api.KindStatefulSet, ns, name, "RolloutStarted", "updating pods from the highest ordinal down")
+			st.Event("Normal", api.KindStatefulSet, ns, name, "RolloutStarted", "updating pods from the highest ordinal down (template or configuration changed)")
 		}
 		ss.Status.CurrentHash = hash
 		ss.Status.Revision++
@@ -627,7 +627,7 @@ func newStatefulPod(ss *api.StatefulSet, ordinal int, now time.Time) *api.Pod {
 	}
 	p := newPod(ss.Metadata.Namespace, name, api.KindStatefulSet, ss.Metadata.Name, tmpl, ss.Spec.NodeSelector, now)
 	// The hash identifies the set's template revision, not the per-pod rewrite.
-	p.Spec.TemplateHash = ss.Spec.Template.Hash()
+	p.Spec.TemplateHash = ss.Status.CurrentHash
 	p.Spec.Subdomain = ss.Spec.ServiceName
 	p.Metadata.Labels["nube/pod-name"] = name
 	return p

@@ -58,10 +58,10 @@ func applyDaemonSet(st *store.State, o api.Object) (string, error) {
 // pods at most maxUnavailable nodes at a time.
 func reconcileDaemonSet(st *store.State, ds *api.DaemonSet, now time.Time) {
 	ns, name := ds.Metadata.Namespace, ds.Metadata.Name
-	hash := ds.Spec.Template.Hash()
+	hash := rolloutHash(&ds.Spec.Template, configDigests(st, ns, &ds.Spec.Template))
 	if ds.Status.CurrentHash != hash {
 		if ds.Status.CurrentHash != "" {
-			st.Event("Normal", api.KindDaemonSet, ns, name, "RolloutStarted", "updating pods node by node")
+			st.Event("Normal", api.KindDaemonSet, ns, name, "RolloutStarted", "updating pods node by node (template or configuration changed)")
 		}
 		ds.Status.CurrentHash = hash
 	}
@@ -93,6 +93,7 @@ func reconcileDaemonSet(st *store.State, ds *api.DaemonSet, now time.Time) {
 			continue
 		}
 		p := newPod(ns, name+"-"+randSuffix(5), api.KindDaemonSet, name, ds.Spec.Template, ds.Spec.NodeSelector, now)
+		p.Spec.TemplateHash = hash
 		st.Pods[p.Metadata.Key()] = p
 		bindPod(st, p, st.Nodes[node], now)
 		byNode[node] = []*api.Pod{p}

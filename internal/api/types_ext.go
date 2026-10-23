@@ -29,6 +29,8 @@ type DaemonSetStatus struct {
 	CurrentHash   string `json:"currentHash"`
 	Phase         string `json:"phase"` // Healthy | Progressing | Degraded
 	Message       string `json:"message,omitempty"`
+	// Recommendation is computed from observed usage (not stored).
+	Recommendation *Recommendation `json:"recommendation,omitempty"`
 }
 
 // DaemonSet runs one pod on every node that matches its selector.

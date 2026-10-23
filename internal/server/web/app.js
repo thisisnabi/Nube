@@ -263,7 +263,7 @@ const renderers = {
         return `<tr>
           <td class="name"><a data-describe="deployments|${id}">${n}</a><div class="sub">${ns}${auto ? ` · autoscale ${auto.min}–${auto.max} @ ${auto.targetCPUPercent}% (now ${x.status.cpuPercent}%)` : ''}</div></td>
           <td>${x.status.readyReplicas}/${x.spec.replicas} ${replicaBlocks(x, d)}</td>
-          <td>${deployChip(x)}${x.status.message ? `<div class="sub trunc" title="${esc(x.status.message)}">${esc(x.status.message)}</div>` : ''}</td>
+          <td>${deployChip(x)}${x.status.message ? `<div class="sub trunc" title="${esc(x.status.message)}">${esc(x.status.message)}</div>` : ''}${x.status.lastRollback ? `<div class="sub trunc" title="${esc(x.status.lastRollback)}">${chip('auto-rollback', 'warn')} ${esc(x.status.lastRollback)}</div>` : ''}${recHint(x.status.recommendation)}</td>
           <td class="mono trunc" title="${esc(mainImage(x.spec.template))}">${esc(mainImage(x.spec.template))}</td>
           <td>${x.status.revision}</td>
           <td>${auto ? '<span class="muted small">auto</span>' : `<span class="scale"><button data-scale="${id}|-1" title="Scale down">−</button><span>${x.spec.replicas}</span><button data-scale="${id}|1" title="Scale up">+</button></span>`}</td>
@@ -751,19 +751,33 @@ function showDescribe(kind, ns, name) {
       <td>${c.ready ? 'yes' : 'no'}</td><td>${c.restarts}</td><td class="mono small">${esc(c.image || '')}</td><td class="small">${esc(c.message || '')}</td></tr>`), '') : '';
   openModal(`${singular} ${ns}/${name}`,
     `${evs.length ? `<h3 class="small muted">RECENT EVENTS</h3><div class="card event-list" style="margin-bottom:14px">${evs.map(eventRow).join('')}</div>` : ''}
-     ${ctrs}<h3 class="small muted">OBJECT</h3><pre class="code">${esc(JSON.stringify(obj, null, 2))}</pre>`,
+     ${ctrs}${obj.status && obj.status.recommendation ? recSection(obj.status.recommendation) : ''}<h3 class="small muted">OBJECT</h3><pre class="code">${esc(JSON.stringify(obj, null, 2))}</pre>`,
     kind === 'pods' && obj.status.containerID ? `<button class="btn small" id="m-logs">Logs</button>` : '');
   const b = $('#m-logs');
   if (b) b.onclick = () => showLogs(ns, name);
+}
+
+// recHint shows a right-sizing suggestion when the requests do not fit observed usage.
+function recHint(r) {
+  if (!r || !r.cpu || r.message === 'requests fit the observed usage') return '';
+  return `<div class="sub trunc" title="${esc(r.message)}">💡 ${esc(r.message)}</div>`;
+}
+
+function recSection(r) {
+  if (!r) return '';
+  const rows = r.cpu ? `<tr><td>Requested</td><td>${r.requests.cpu}m</td><td>${r.requests.memory}Mi</td></tr>
+    <tr><td>Recommended</td><td><b>${r.cpu}m</b></td><td><b>${r.memory}Mi</b></td></tr>` : '';
+  return `<h3 class="small muted">RESOURCES PER POD (from ${r.minutes} min of usage)</h3>
+    ${rows ? table(['', 'CPU', 'Memory'], [rows], '') : ''}<p class="small">${esc(r.message || '')}</p>`;
 }
 
 function showHistory(ns, name) {
   const dep = findObj('deployments', ns, name);
   if (!dep) return;
   const rows = (dep.status.history || []).slice().reverse().map(h => `<tr>
-    <td><b>${h.revision}</b></td><td class="mono">${esc(mainImage(h.template))}</td><td>${ago(h.createdAt)} ago</td>
+    <td><b>${h.revision}</b></td><td class="mono">${esc(mainImage(h.template))}</td><td class="small">${esc(h.cause || '')}</td><td>${ago(h.createdAt)} ago</td>
     <td>${h.hash === dep.status.currentHash ? chip('current', 'ok') : `<button class="btn small" data-rollback="${h.revision}">Roll back</button>`}</td></tr>`);
-  openModal(`Rollout history · ${name}`, table(['Revision', 'Image', 'Created', ''], rows, 'No history yet.'));
+  openModal(`Rollout history · ${name}`, table(['Revision', 'Image', 'Cause', 'Created', ''], rows, 'No history yet.'));
   document.querySelectorAll('[data-rollback]').forEach(b => b.onclick = async () => {
     await act(post(objPath('deployments', ns, name) + '/rollback', { revision: Number(b.dataset.rollback) }));
     closeModal();
