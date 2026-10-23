@@ -75,8 +75,18 @@ func (s *Server) applyObject(st *store.State, o api.Object) (string, error) {
 		return applyStatefulSet(st, o)
 	case api.KindIngress:
 		return applyIngress(st, o)
+	case api.KindDaemonSet:
+		return applyDaemonSet(st, o)
+	case api.KindNetworkPolicy:
+		return applyNetworkPolicy(st, o)
+	case api.KindCRD:
+		return applyCRD(st, o)
+	case api.KindVolumeSnapshot:
+		return applyVolumeSnapshot(st, o)
+	case api.KindNode, api.KindToken:
+		return "", fmt.Errorf("kind %s cannot be applied", o.Kind)
 	}
-	return "", fmt.Errorf("kind %s cannot be applied", o.Kind)
+	return applyCustom(st, o)
 }
 
 func applyDeployment(st *store.State, o api.Object) (string, error) {
@@ -300,6 +310,26 @@ func applyVolume(st *store.State, o api.Object) (string, error) {
 	if _, err := api.ParseMemory(v.Spec.Size); err != nil {
 		return "", fmt.Errorf("volume/%s: invalid size", o.Name)
 	}
+	switch v.Spec.AccessMode {
+	case "", "ReadWriteMany":
+	case "ReadWriteOnce":
+		if v.Spec.Type != "nfs" || v.Spec.Size == "" {
+			return "", fmt.Errorf("volume/%s: accessMode ReadWriteOnce is for nfs volumes with a size", o.Name)
+		}
+	default:
+		return "", fmt.Errorf("volume/%s: accessMode must be ReadWriteMany or ReadWriteOnce", o.Name)
+	}
+	if v.Spec.RestoreFrom != "" {
+		snap := st.Snapshots[o.Namespace+"/"+v.Spec.RestoreFrom]
+		if snap == nil || snap.Status.Phase != "Ready" {
+			return "", fmt.Errorf("volume/%s: restoreFrom snapshot %q is not ready", o.Name, v.Spec.RestoreFrom)
+		}
+	}
+	if v.Spec.Backup != nil {
+		if _, err := parseSchedule(v.Spec.Backup.Schedule); err != nil {
+			return "", fmt.Errorf("volume/%s: backup.schedule: %w", o.Name, err)
+		}
+	}
 	v.Kind = api.KindVolume
 	v.Metadata.Name, v.Metadata.Namespace = o.Name, o.Namespace
 	key := v.Metadata.Key()
@@ -321,6 +351,7 @@ func applyVolume(st *store.State, o api.Object) (string, error) {
 	}
 	touchMeta(&v.Metadata, nil)
 	v.Status.Phase = "Available"
+	v.Status.RestoreFrom = v.Spec.RestoreFrom
 	if v.Spec.Type == "local" && v.Spec.NodeName != "" {
 		v.Status.NodeName, v.Status.Phase = v.Spec.NodeName, "Bound"
 	}
@@ -450,6 +481,47 @@ func (s *Server) deleteObject(st *store.State, kind, ns, name string, force bool
 		}
 		delete(st.Ingresses, key)
 		st.Event("Normal", api.KindIngress, ns, name, "Deleted", "ingress deleted")
+	case api.KindDaemonSet:
+		if st.DaemonSets[key] == nil {
+			return notFound("daemonset/" + name)
+		}
+		for _, p := range st.PodsOwned(ns, api.KindDaemonSet, name) {
+			terminatePod(st, p, force)
+		}
+		delete(st.DaemonSets, key)
+		st.Event("Normal", api.KindDaemonSet, ns, name, "Deleted", "daemonset deleted")
+	case api.KindNetworkPolicy:
+		if st.Policies[key] == nil {
+			return notFound("networkpolicy/" + name)
+		}
+		delete(st.Policies, key)
+		st.Event("Normal", api.KindNetworkPolicy, ns, name, "Deleted", "network policy deleted")
+	case api.KindVolumeSnapshot:
+		if st.Snapshots[key] == nil {
+			return notFound("volumesnapshot/" + name)
+		}
+		if snapshotInUse(st, st.Snapshots[key]) && !force {
+			return fmt.Errorf("volumesnapshot/%s is needed by a pending restore or move (use --force to delete anyway)", name)
+		}
+		delete(st.Snapshots, key)
+		st.Event("Normal", api.KindVolumeSnapshot, ns, name, "Deleted", "snapshot deleted")
+	case api.KindCRD:
+		var crd *api.CustomResourceDefinition
+		for _, c := range st.CRDs {
+			if c.Metadata.Name == name {
+				crd = c
+			}
+		}
+		if crd == nil {
+			return notFound("customresourcedefinition/" + name)
+		}
+		for k, o := range st.Custom {
+			if o.Kind == crd.Spec.Kind && !strings.HasPrefix(k, "~") {
+				deleteCustom(st, o.Kind, o.Metadata.Namespace, o.Metadata.Name)
+			}
+		}
+		delete(st.CRDs, crd.Spec.Kind)
+		st.Event("Normal", api.KindCRD, "", name, "Deleted", "custom resource "+crd.Spec.Kind+" and all its objects deleted")
 	case api.KindNode:
 		if st.Nodes[name] == nil {
 			return notFound("node/" + name)
@@ -462,6 +534,9 @@ func (s *Server) deleteObject(st *store.State, kind, ns, name string, force bool
 		delete(st.Nodes, name)
 		st.Event("Normal", api.KindNode, "", name, "Removed", "node removed from cluster")
 	default:
+		if crd := st.CRDByName(kind); crd != nil {
+			return deleteCustom(st, crd.Spec.Kind, ns, name)
+		}
 		return fmt.Errorf("unknown kind %q", kind)
 	}
 	return nil

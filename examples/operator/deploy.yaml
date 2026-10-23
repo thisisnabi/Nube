@@ -1,0 +1,21 @@
+# Run the operator inside the cluster. Build and load its image first:
+#   CGO_ENABLED=0 GOOS=linux go build -o website-operator ./examples/operator
+#   docker build -t website-operator:1 -f examples/operator/Dockerfile .   (on each node, or push to a registry)
+# and create its token:
+#   nube token create website-operator --role edit
+kind: Secret
+metadata:
+  name: website-operator
+stringData:
+  NUBE_TOKEN: paste-the-edit-token-here
+---
+kind: Deployment
+metadata:
+  name: website-operator
+spec:
+  replicas: 1
+  template:
+    image: website-operator:1
+    imagePullPolicy: IfNotPresent
+    envFrom: [{ secret: website-operator }]
+    # NUBE_API_SERVER and NUBE_CA_HASH are injected by the node agent.

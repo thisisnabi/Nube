@@ -25,9 +25,17 @@ type certs struct {
 	caHash  string
 	current *tls.Certificate
 	temp    *tls.Certificate
+	user    *tls.Certificate
+	userMod time.Time
 }
 
-func (c *certs) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (c *certs) get(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if hello != nil && c.s.acme != nil && c.s.cfg.ACMEDomain != "" && strings.EqualFold(hello.ServerName, c.s.cfg.ACMEDomain) {
+		return c.s.acme.getCertificate(hello)
+	}
+	if hello != nil && c.s.cfg.TLSCertFile != "" {
+		return c.userCert()
+	}
 	caCert, caKey := c.s.ca()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -49,6 +57,25 @@ func (c *certs) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		c.current, c.caHash = &t, h
 	}
 	return c.current, nil
+}
+
+// userCert serves --tls-cert/--tls-key, reloading them when they change
+// (e.g. after certbot renews them).
+func (c *certs) userCert() (*tls.Certificate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, err := os.Stat(c.s.cfg.TLSCertFile)
+	if err != nil {
+		return nil, err
+	}
+	if c.user == nil || st.ModTime().After(c.userMod) {
+		cert, err := tls.LoadX509KeyPair(c.s.cfg.TLSCertFile, c.s.cfg.TLSKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		c.user, c.userMod = &cert, st.ModTime()
+	}
+	return c.user, nil
 }
 
 // certHosts lists every name and address clients may use for this server.

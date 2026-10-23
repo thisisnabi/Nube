@@ -74,7 +74,7 @@ var roleRank = map[string]int{api.RoleView: 1, api.RoleEdit: 2, api.RoleAdmin: 3
 func requiredRole(r *http.Request) string {
 	p := r.URL.Path
 	switch {
-	case p == "/api/v1/agent/sync":
+	case strings.HasPrefix(p, "/api/v1/agent/"):
 		return api.RoleNode
 	case p == "/api/v1/version" || p == "/api/v1/whoami":
 		return "" // any authenticated identity

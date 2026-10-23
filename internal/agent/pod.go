@@ -611,7 +611,12 @@ func (a *Agent) createContainer(ctx context.Context, ap api.AssignedPod, ps *pod
 		}
 		mounts = append(mounts, m)
 	}
-	env := make([]string, 0, len(ap.Env[c.Name]))
+	env := make([]string, 0, len(ap.Env[c.Name])+2)
+	for k, v := range a.apiEnv() {
+		if _, set := ap.Env[c.Name][k]; !set {
+			env = append(env, k+"="+v)
+		}
+	}
 	for k, v := range ap.Env[c.Name] {
 		env = append(env, k+"="+v)
 	}
@@ -649,12 +654,36 @@ func (a *Agent) prepareMount(ctx context.Context, ap api.AssignedPod, vm api.Vol
 		return Mount{}, fmt.Errorf("volume %q not found", vm.Volume)
 	}
 	key := v.Metadata.Namespace + "/" + v.Metadata.Name
+	bind := func(path string) Mount {
+		return Mount{Type: "bind", Source: path, Target: vm.ContainerPath, ReadOnly: vm.ReadOnly}
+	}
 	switch v.Spec.Type {
 	case "hostPath":
 		os.MkdirAll(v.Spec.HostPath, 0o755)
 		a.recordVolume(key, v.Spec.HostPath, false, "hostPath: size not enforced")
-		return Mount{Type: "bind", Source: v.Spec.HostPath, Target: vm.ContainerPath, ReadOnly: vm.ReadOnly}, nil
+		return bind(v.Spec.HostPath), nil
 	case "nfs":
+		if v.Spec.AccessMode == "ReadWriteOnce" {
+			// An ext4 image on the share: size enforced, one node at a time,
+			// and pods can move to any node because the data is on NFS.
+			size, _ := api.ParseMemory(v.Spec.Size)
+			share, err := a.mountNFSShare(v.Spec.NFS)
+			if err != nil {
+				return Mount{}, err
+			}
+			path, err := a.sized.EnsureIn(share, v.DockerName(), size, true)
+			if err != nil {
+				return Mount{}, fmt.Errorf("nfs volume %s: %w", vm.Volume, err)
+			}
+			a.mu.Lock()
+			a.nfsImages[key] = v.DockerName()
+			a.mu.Unlock()
+			if err := a.restoreInto(ctx, v, path); err != nil {
+				return Mount{}, err
+			}
+			a.recordVolume(key, path, true, "")
+			return bind(path), nil
+		}
 		o := "addr=" + v.Spec.NFS.Server + ",rw"
 		if v.Spec.NFS.Options != "" {
 			o += "," + v.Spec.NFS.Options
@@ -663,16 +692,20 @@ func (a *Agent) prepareMount(ctx context.Context, ap api.AssignedPod, vm api.Vol
 		if err := a.docker.EnsureVolume(ctx, v.DockerName(), opts, nil); err != nil {
 			return Mount{}, fmt.Errorf("nfs volume %s: %w", vm.Volume, err)
 		}
-		a.recordVolume(key, "", false, "nfs: the size is managed by the NFS server")
+		a.recordVolume(key, "", false, "shared nfs (ReadWriteMany): use accessMode ReadWriteOnce to enforce the size")
 		return Mount{Type: "volume", Source: v.DockerName(), Target: vm.ContainerPath, ReadOnly: vm.ReadOnly}, nil
 	}
 	// local
 	size, _ := api.ParseMemory(v.Spec.Size)
-	if size > 0 && !a.docker.VolumeExists(ctx, v.DockerName()) {
+	legacy := a.docker.VolumeExists(ctx, v.DockerName())
+	if size > 0 && !legacy {
 		path, err := a.sized.Ensure(v.DockerName(), size)
 		if err == nil {
+			if err := a.restoreInto(ctx, v, path); err != nil {
+				return Mount{}, err
+			}
 			a.recordVolume(key, path, true, "")
-			return Mount{Type: "bind", Source: path, Target: vm.ContainerPath, ReadOnly: vm.ReadOnly}, nil
+			return bind(path), nil
 		}
 		log.Printf("agent: volume %s: size cannot be enforced (%v); using an unlimited Docker volume", key, err)
 		a.recordVolume(key, "", false, "size not enforced: "+err.Error())
@@ -683,6 +716,15 @@ func (a *Agent) prepareMount(ctx context.Context, ap api.AssignedPod, vm api.Vol
 	}
 	if err := a.docker.EnsureVolume(ctx, v.DockerName(), nil, nil); err != nil {
 		return Mount{}, fmt.Errorf("volume %s: %w", vm.Volume, err)
+	}
+	if v.Status.RestoreFrom != "" && v.Status.Restored != v.Status.RestoreFrom {
+		mp, err := a.docker.VolumeMountpoint(ctx, v.DockerName())
+		if err != nil {
+			return Mount{}, err
+		}
+		if err := a.restoreInto(ctx, v, mp); err != nil {
+			return Mount{}, err
+		}
 	}
 	return Mount{Type: "volume", Source: v.DockerName(), Target: vm.ContainerPath, ReadOnly: vm.ReadOnly}, nil
 }

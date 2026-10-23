@@ -1,15 +1,16 @@
 package store
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -19,20 +20,27 @@ import (
 	"github.com/thisisnabi/Nube/internal/api"
 )
 
-// RaftStore replicates the state across control-plane servers with the Raft
-// consensus protocol. Every committed log entry is a full state snapshot, which
-// keeps the state machine trivially deterministic; for a personal cluster the
-// state is small enough that this is cheap.
+// RaftStore replicates the state across control-plane servers with Raft.
+// Each log entry is a Patch holding only the objects a write changed, so the
+// log grows with the size of changes, not with the size of the cluster.
+//
+// Writes run on the leader's live state; the result is diffed against the
+// committed mirror, replicated, and rolled back from the mirror if the entry
+// cannot be committed.
 type RaftStore struct {
 	id      string
 	raft    *raft.Raft
 	bolt    *raftboltdb.BoltStore
 	trans   *raft.NetworkTransport
 	writeMu sync.Mutex // serializes writers on the leader
+	seq     atomic.Int64
 
-	mu    sync.RWMutex
-	state *State
-	last  []byte // serialized form of state
+	mu     sync.RWMutex
+	state  *State
+	mirror *committed
+	// live holds origins of entries already applied to the live state but not
+	// yet committed. Only those are skipped when they come back through Apply.
+	live map[string]bool
 }
 
 type RaftOptions struct {
@@ -48,14 +56,15 @@ func NewRaftStore(o RaftOptions) (*RaftStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	rs := &RaftStore{id: o.ID, state: NewState()}
-	rs.last, _ = json.Marshal(rs.state)
+	rs := &RaftStore{id: o.ID, state: NewState(), live: map[string]bool{}}
+	rs.seq.Store(time.Now().UnixNano()) // origins are unique across restarts
+	rs.mirror = snapshotOf(rs.state)
 
 	cfg := raft.DefaultConfig()
 	cfg.LocalID = raft.ServerID(o.ID)
-	cfg.SnapshotThreshold = 512
-	cfg.SnapshotInterval = 30 * time.Second
-	cfg.TrailingLogs = 256
+	cfg.SnapshotThreshold = 2048
+	cfg.SnapshotInterval = 60 * time.Second
+	cfg.TrailingLogs = 1024
 	cfg.Logger = hclog.New(&hclog.LoggerOptions{Name: "raft", Level: hclog.Warn, Output: os.Stderr})
 
 	adv, err := net.ResolveTCPAddr("tcp", o.Advertise)
@@ -108,27 +117,32 @@ func (r *RaftStore) Write(fn func(*State) error) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
-	r.mu.RLock()
-	clone, err := decodeState(r.last)
-	r.mu.RUnlock()
-	if err != nil {
+	r.mu.Lock()
+	if err := fn(r.state); err != nil {
+		r.rollbackLocked()
+		r.mu.Unlock()
 		return err
 	}
-	if err := fn(clone); err != nil {
-		return err
-	}
-	b, err := json.Marshal(clone)
-	if err != nil {
-		return err
-	}
-	r.mu.RLock()
-	same := bytes.Equal(b, r.last)
-	r.mu.RUnlock()
-	if same {
+	p := diff(r.state, r.mirror)
+	if p.empty() {
+		r.mu.Unlock()
 		return nil
 	}
-	f := r.raft.Apply(b, 5*time.Second)
+	p.Origin = fmt.Sprintf("%s#%d", r.id, r.seq.Add(1))
+	data, err := json.Marshal(p)
+	if err != nil {
+		r.rollbackLocked()
+		r.mu.Unlock()
+		return err
+	}
+	r.live[p.Origin] = true
+	r.mu.Unlock()
+
+	f := r.raft.Apply(data, 10*time.Second)
 	if err := f.Error(); err != nil {
+		r.mu.Lock()
+		r.rollbackLocked()
+		r.mu.Unlock()
 		if err == raft.ErrNotLeader || err == raft.ErrLeadershipLost {
 			return ErrNotLeader
 		}
@@ -138,6 +152,18 @@ func (r *RaftStore) Write(fn func(*State) error) error {
 		return resp
 	}
 	return nil
+}
+
+// rollbackLocked discards uncommitted changes by rebuilding from the mirror.
+// Pending entries may still commit later; they are then applied normally.
+func (r *RaftStore) rollbackLocked() {
+	st, err := r.mirror.state()
+	if err != nil {
+		log.Printf("store: rollback failed: %v", err)
+		return
+	}
+	r.state = st
+	r.live = map[string]bool{}
 }
 
 func (r *RaftStore) IsLeader() bool { return r.raft.State() == raft.Leader }
@@ -247,20 +273,28 @@ func (r *RaftStore) Close() error {
 type fsm RaftStore
 
 func (f *fsm) Apply(l *raft.Log) any {
-	st, err := decodeState(l.Data)
-	if err != nil {
+	var p Patch
+	if err := json.Unmarshal(l.Data, &p); err != nil {
 		return err
 	}
 	f.mu.Lock()
-	f.state, f.last = st, l.Data
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	// The leader already applied its own pending write to the live state;
+	// everything else (followers, replays, entries rolled back locally but
+	// committed anyway) is applied here.
+	if f.live[p.Origin] {
+		delete(f.live, p.Origin)
+	} else if err := p.apply(f.state); err != nil {
+		return err
+	}
+	f.mirror.record(&p)
 	return nil
 }
 
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return snapshot(f.last), nil
+	return snapshot(f.mirror.encode()), nil // committed data only
 }
 
 func (f *fsm) Restore(rc io.ReadCloser) error {
@@ -274,7 +308,7 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 		return err
 	}
 	f.mu.Lock()
-	f.state, f.last = st, b
+	f.state, f.mirror, f.live = st, snapshotOf(st), map[string]bool{}
 	f.mu.Unlock()
 	return nil
 }

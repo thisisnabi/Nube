@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +25,11 @@ type Object struct {
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
+
+var customKindRE = regexp.MustCompile(`^[A-Z][A-Za-z0-9]{0,62}$`)
+
+// ValidCustomKind reports whether s can name a custom resource kind (e.g. "Website").
+func ValidCustomKind(s string) bool { return customKindRE.MatchString(s) }
 
 // ValidName reports whether s is a DNS-label style name.
 func ValidName(s string) bool { return nameRE.MatchString(s) }
@@ -96,7 +102,11 @@ func toObject(doc any) (Object, error) {
 	}
 	kind := NormalizeKind(head.Kind)
 	if kind == "" {
-		return Object{}, fmt.Errorf("unknown kind %q", head.Kind)
+		// Not built in: a custom resource, resolved by the server against its CRDs.
+		if !customKindRE.MatchString(head.Kind) {
+			return Object{}, fmt.Errorf("unknown kind %q", head.Kind)
+		}
+		kind = head.Kind
 	}
 	if !ValidName(head.Metadata.Name) {
 		return Object{}, fmt.Errorf("%s: invalid metadata.name %q (lowercase letters, digits and '-')", kind, head.Metadata.Name)
@@ -135,6 +145,14 @@ func NormalizeKind(k string) string {
 		return KindIngress
 	case "token", "tokens":
 		return KindToken
+	case "daemonset", "daemonsets", "ds":
+		return KindDaemonSet
+	case "networkpolicy", "networkpolicies", "netpol", "np":
+		return KindNetworkPolicy
+	case "customresourcedefinition", "customresourcedefinitions", "crd", "crds":
+		return KindCRD
+	case "volumesnapshot", "volumesnapshots", "snapshot", "snapshots", "vs":
+		return KindVolumeSnapshot
 	}
 	return ""
 }
@@ -166,6 +184,14 @@ func Plural(kind string) string {
 		return "ingresses"
 	case KindToken:
 		return "tokens"
+	case KindDaemonSet:
+		return "daemonsets"
+	case KindNetworkPolicy:
+		return "networkpolicies"
+	case KindCRD:
+		return "customresourcedefinitions"
+	case KindVolumeSnapshot:
+		return "volumesnapshots"
 	}
 	return strings.ToLower(kind) + "s"
 }
@@ -258,8 +284,8 @@ func (t *PodTemplate) Hash() string {
 
 // Validate checks a pod template for obvious mistakes.
 func (t *PodTemplate) Validate() error {
-	if len(t.Containers) > 0 && t.Image != "" {
-		return errors.New("use either the inline image (single container) or containers, not both")
+	if len(t.Containers) > 0 && !reflect.ValueOf(t.Container).IsZero() {
+		return errors.New("with containers, put image, command, env, ports, volumes etc. inside each container (top-level container fields are the single-container shorthand)")
 	}
 	switch t.RestartPolicy {
 	case "", "Always", "OnFailure", "Never":

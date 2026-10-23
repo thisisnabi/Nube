@@ -36,6 +36,13 @@ func (v *sizedVolumes) supported() error {
 
 // Ensure returns the mount path of the volume, creating, mounting or growing it.
 func (v *sizedVolumes) Ensure(name string, sizeMiB int64) (string, error) {
+	return v.EnsureIn(v.dir, name, sizeMiB, false)
+}
+
+// EnsureIn keeps the image file in imgDir (e.g. an NFS share) while mounting
+// it locally. shared=true enables ext4 multi-mount protection, so a second
+// node cannot mount the same image while it is in use.
+func (v *sizedVolumes) EnsureIn(imgDir, name string, sizeMiB int64, shared bool) (string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if err := v.supported(); err != nil {
@@ -44,7 +51,7 @@ func (v *sizedVolumes) Ensure(name string, sizeMiB int64) (string, error) {
 	if err := os.MkdirAll(v.dir, 0o700); err != nil {
 		return "", err
 	}
-	img := filepath.Join(v.dir, name+".img")
+	img := filepath.Join(imgDir, name+".img")
 	mnt := filepath.Join(v.dir, name)
 	want := imageBytes(sizeMiB)
 
@@ -63,7 +70,11 @@ func (v *sizedVolumes) Ensure(name string, sizeMiB int64) (string, error) {
 		}
 		// -m 0: no root-reserved blocks, the whole size is usable.
 		journal := min(max(sizeMiB/64, 4), 64)
-		args := []string{"-q", "-F", "-m", "0", "-i", "32768", "-J", fmt.Sprintf("size=%d", journal), "-L", trimLabel(name), img}
+		args := []string{"-q", "-F", "-m", "0", "-i", "32768", "-J", fmt.Sprintf("size=%d", journal), "-L", trimLabel(name)}
+		if shared {
+			args = append(args, "-O", "mmp")
+		}
+		args = append(args, img)
 		if out, err := exec.Command("mkfs.ext4", args...).CombinedOutput(); err != nil {
 			os.Remove(img)
 			return "", fmt.Errorf("mkfs.ext4: %v: %s", err, strings.TrimSpace(string(out)))
@@ -78,6 +89,15 @@ func (v *sizedVolumes) Ensure(name string, sizeMiB int64) (string, error) {
 		return "", err
 	}
 	if !isMounted(mnt) {
+		if shared {
+			// The previous node may have died with it mounted: repair first.
+			// With multi-mount protection this fails if it is mounted elsewhere.
+			if out, err := exec.Command("e2fsck", "-p", img).CombinedOutput(); err != nil {
+				if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() > 1 {
+					return "", fmt.Errorf("e2fsck %s (in use on another node?): %v: %s", img, err, strings.TrimSpace(string(out)))
+				}
+			}
+		}
 		if out, err := exec.Command("mount", "-o", "loop", img, mnt).CombinedOutput(); err != nil {
 			return "", fmt.Errorf("mount %s: %v: %s", img, err, strings.TrimSpace(string(out)))
 		}
@@ -95,6 +115,20 @@ func (v *sizedVolumes) Ensure(name string, sizeMiB int64) (string, error) {
 		}
 	}
 	return mnt, nil
+}
+
+// Unmount releases a mounted volume without deleting it.
+func (v *sizedVolumes) Unmount(name string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	mnt := filepath.Join(v.dir, name)
+	if !isMounted(mnt) {
+		return nil
+	}
+	if out, err := exec.Command("umount", mnt).CombinedOutput(); err != nil {
+		return fmt.Errorf("umount %s: %v: %s", mnt, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // Remove unmounts and deletes a volume (used for pod-scoped emptyDirs).

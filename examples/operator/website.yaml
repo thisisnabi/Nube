@@ -1,0 +1,7 @@
+kind: Website
+metadata:
+  name: blog
+spec:
+  image: nginx:alpine
+  replicas: 2
+  host: blog.example.com

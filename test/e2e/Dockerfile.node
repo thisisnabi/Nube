@@ -1,6 +1,6 @@
 # Test-only image: a "machine" with its own Docker daemon + nube agent.
 FROM docker:28-dind
-RUN apk add --no-cache wireguard-tools iproute2 iptables curl bind-tools e2fsprogs e2fsprogs-extra util-linux
+RUN apk add --no-cache wireguard-tools iproute2 iptables curl bind-tools e2fsprogs e2fsprogs-extra util-linux nfs-utils
 COPY nube /usr/local/bin/nube
 COPY node-entry.sh /node-entry.sh
 RUN chmod +x /node-entry.sh /usr/local/bin/nube

@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/crypto/acme"
+
 	"github.com/thisisnabi/Nube/internal/api"
 	"github.com/thisisnabi/Nube/internal/pki"
 	"github.com/thisisnabi/Nube/internal/store"
@@ -67,8 +69,15 @@ func applyIngress(st *store.State, o api.Object) (string, error) {
 		}
 	}
 	for i := range ing.Spec.TLS {
-		for k, h := range ing.Spec.TLS[i].Hosts {
-			ing.Spec.TLS[i].Hosts[k] = strings.ToLower(h)
+		t := &ing.Spec.TLS[i]
+		for k, h := range t.Hosts {
+			t.Hosts[k] = strings.ToLower(h)
+			if t.ACME && strings.HasPrefix(h, "*.") {
+				return "", fmt.Errorf("ingress/%s: ACME (HTTP-01) cannot issue wildcard certificates; use a tls Secret for %s", o.Name, h)
+			}
+		}
+		if t.ACME && t.SecretName != "" {
+			return "", fmt.Errorf("ingress/%s: use either acme: true or secretName, not both", o.Name)
 		}
 	}
 	ing.Kind = api.KindIngress
@@ -107,7 +116,7 @@ func reconcileIngressStatus(st *store.State) {
 			}
 		}
 		for _, t := range ing.Spec.TLS {
-			if t.SecretName == "" {
+			if t.ACME || t.SecretName == "" {
 				continue
 			}
 			if sec := st.Secrets[ns+"/"+t.SecretName]; sec == nil || sec.Type != "tls" {
@@ -153,15 +162,16 @@ type ingressRoute struct {
 }
 
 type ingress struct {
-	s        *Server
-	mu       sync.RWMutex
-	routes   []ingressRoute
-	certs    map[string]*tls.Certificate // by SNI host
-	selfSign map[string]*tls.Certificate
-	tlsHosts []api.IngressTLS
-	secrets  map[string]*api.Secret // ns/name -> tls secret
-	requests sync.Map               // ingress key -> *atomic.Int64
-	rr       atomic.Uint64
+	s          *Server
+	mu         sync.RWMutex
+	routes     []ingressRoute
+	certs      map[string]*tls.Certificate // by SNI host
+	selfSign   map[string]*tls.Certificate
+	tlsHosts   []api.IngressTLS
+	secrets    map[string]*api.Secret // ns/name -> tls secret
+	prefetched map[string]bool
+	requests   sync.Map // ingress key -> *atomic.Int64
+	rr         atomic.Uint64
 
 	lnMu      sync.Mutex
 	listeners map[string]*http.Server // "http|ip:port" -> server
@@ -215,7 +225,7 @@ func (in *ingress) refresh() {
 				for _, h := range t.Hosts {
 					tlsSet[h] = true
 				}
-				tlsHosts = append(tlsHosts, api.IngressTLS{Hosts: t.Hosts, SecretName: ns + "/" + t.SecretName})
+				tlsHosts = append(tlsHosts, api.IngressTLS{Hosts: t.Hosts, SecretName: ns + "/" + t.SecretName, ACME: t.ACME})
 				if sec := st.Secrets[ns+"/"+t.SecretName]; sec != nil && sec.Type == "tls" && t.SecretName != "" {
 					c := *sec
 					secrets[ns+"/"+t.SecretName] = &c
@@ -266,7 +276,23 @@ func (in *ingress) refresh() {
 	in.mu.Lock()
 	in.routes, in.tlsHosts, in.secrets = routes, tlsHosts, secrets
 	in.certs = map[string]*tls.Certificate{} // re-resolve (secrets may have changed)
+	var fetch []string
+	if in.prefetched == nil {
+		in.prefetched = map[string]bool{}
+	}
+	for _, t := range tlsHosts {
+		for _, h := range t.Hosts {
+			if t.ACME && !in.prefetched[h] {
+				in.prefetched[h] = true
+				fetch = append(fetch, h)
+			}
+		}
+	}
 	in.mu.Unlock()
+	// New hosts get their certificates right away instead of at the leader's next round.
+	if len(fetch) > 0 && in.s.acme != nil {
+		in.s.acme.wake()
+	}
 }
 
 func hostMatches(pattern, host string) bool {
@@ -344,6 +370,11 @@ func (in *ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // secret if configured, otherwise a cached self-signed one.
 func (in *ingress) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	name := strings.ToLower(hello.ServerName)
+	if in.s.acme != nil && (in.acmeHost(name) || isALPNChallenge(hello)) {
+		if c, err := in.s.acme.getCertificate(hello); err == nil {
+			return c, nil
+		}
+	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	if c := in.certs[name]; c != nil {
@@ -419,9 +450,13 @@ func (in *ingress) syncListeners() {
 			continue
 		}
 		delete(in.lastErr, k)
-		srv := &http.Server{Handler: in, ReadHeaderTimeout: 15 * time.Second, ErrorLog: log.New(discard{}, "", 0)}
+		var handler http.Handler = in
+		if kind == "http" && in.s.acme != nil {
+			handler = in.s.acme.m.HTTPHandler(in) // answers /.well-known/acme-challenge/
+		}
+		srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, ErrorLog: log.New(discard{}, "", 0)}
 		if kind == "https" {
-			ln = tls.NewListener(ln, &tls.Config{GetCertificate: in.getCertificate, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}})
+			ln = tls.NewListener(ln, &tls.Config{GetCertificate: in.getCertificate, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1", acme.ALPNProto}})
 		}
 		in.listeners[k] = srv
 		go func() {
@@ -436,6 +471,69 @@ type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
 
+// acmeHost reports whether a host is listed in an Ingress TLS entry with acme: true.
+func (in *ingress) acmeHost(host string) bool {
+	in.mu.RLock()
+	defer in.mu.RUnlock()
+	for _, t := range in.tlsHosts {
+		if !t.ACME {
+			continue
+		}
+		for _, h := range t.Hosts {
+			if strings.EqualFold(h, host) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// acmeHosts lists the hosts of Ingress TLS entries with acme: true.
+func (in *ingress) acmeHosts() []string {
+	in.mu.RLock()
+	defer in.mu.RUnlock()
+	var hosts []string
+	for _, t := range in.tlsHosts {
+		if t.ACME {
+			hosts = append(hosts, t.Hosts...)
+		}
+	}
+	return hosts
+}
+
+func isALPNChallenge(hello *tls.ClientHelloInfo) bool {
+	for _, p := range hello.SupportedProtos {
+		if p == acme.ALPNProto {
+			return true
+		}
+	}
+	return false
+}
+
+// decorate adds the live request counters and ACME errors to copies of the ingresses.
+func (in *ingress) acmeStatus(ing *api.Ingress) string {
+	if in.s.acme == nil {
+		for _, t := range ing.Spec.TLS {
+			if t.ACME {
+				return "acme: true but the server has no --acme-email; serving self-signed"
+			}
+		}
+		return ""
+	}
+	var msgs []string
+	for _, t := range ing.Spec.TLS {
+		if !t.ACME {
+			continue
+		}
+		for _, h := range t.Hosts {
+			if e := in.s.acme.lastError(h); e != "" {
+				msgs = append(msgs, h+": "+e)
+			}
+		}
+	}
+	return strings.Join(msgs, "; ")
+}
+
 // decorate adds the live request counters to copies of the ingresses.
 func (in *ingress) decorate(list []*api.Ingress) []*api.Ingress {
 	out := make([]*api.Ingress, len(list))
@@ -443,6 +541,9 @@ func (in *ingress) decorate(list []*api.Ingress) []*api.Ingress {
 		c := *ing
 		if v, ok := in.requests.Load(ing.Metadata.Key()); ok {
 			c.Status.Requests = v.(*atomic.Int64).Load()
+		}
+		if m := in.acmeStatus(ing); m != "" {
+			c.Status.Message = strings.TrimPrefix(c.Status.Message+"; "+m, "; ")
 		}
 		out[i] = &c
 	}

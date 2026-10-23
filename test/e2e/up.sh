@@ -5,6 +5,7 @@
 #   ./up.sh          start
 #   ./up.sh nodes    recreate the two nodes (e.g. after rebuilding the image)
 #   ./up.sh down     remove everything
+#   SERVER_ARGS="--acme-email ..." ./up.sh   pass extra flags to the servers
 #
 # Then:  export NUBE_SERVER=https://127.0.0.1:7070 NUBE_TOKEN=testtoken123 NUBE_CA_HASH=$(cat .ca-hash)
 set -euo pipefail
@@ -47,7 +48,7 @@ server() {
   nargs=("$@")
   docker run -d --name "nube-$id" --network nubetest --ip "$ip" "${dargs[@]}" nube-test-server \
     --ha --id "$id" --token "$T" --data /data --raft-advertise "$ip:7072" --advertise-api "https://$ip:7070" \
-    "${nargs[@]}" >/dev/null
+    "${nargs[@]}" ${SERVER_ARGS:-} >/dev/null
 }
 
 server s1 172.30.0.11 -p 7070:7070 -p 18080:8080 -p 18081:80 -p 18443:443 -- --bootstrap

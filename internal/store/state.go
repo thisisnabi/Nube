@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/thisisnabi/Nube/internal/api"
@@ -18,19 +19,26 @@ const maxEvents = 500
 // State is the complete desired + observed state of the cluster.
 // It is always accessed through Store.Read / Store.Write.
 type State struct {
-	Nodes        map[string]*api.Node         `json:"nodes"`
-	Deployments  map[string]*api.Deployment   `json:"deployments"`
-	Pods         map[string]*api.Pod          `json:"pods"`
-	Services     map[string]*api.Service      `json:"services"`
-	ConfigMaps   map[string]*api.ConfigMap    `json:"configMaps"`
-	Secrets      map[string]*api.Secret       `json:"secrets"`
-	Volumes      map[string]*api.Volume       `json:"volumes"`
-	Jobs         map[string]*api.Job          `json:"jobs"`
-	CronJobs     map[string]*api.CronJob      `json:"cronJobs"`
-	StatefulSets map[string]*api.StatefulSet  `json:"statefulSets"`
-	Ingresses    map[string]*api.Ingress      `json:"ingresses"`
-	Tokens       map[string]*api.Token        `json:"tokens"` // by token id
-	Servers      map[string]*api.ServerMember `json:"servers"`
+	Nodes        map[string]*api.Node                     `json:"nodes"`
+	Deployments  map[string]*api.Deployment               `json:"deployments"`
+	Pods         map[string]*api.Pod                      `json:"pods"`
+	Services     map[string]*api.Service                  `json:"services"`
+	ConfigMaps   map[string]*api.ConfigMap                `json:"configMaps"`
+	Secrets      map[string]*api.Secret                   `json:"secrets"`
+	Volumes      map[string]*api.Volume                   `json:"volumes"`
+	Jobs         map[string]*api.Job                      `json:"jobs"`
+	CronJobs     map[string]*api.CronJob                  `json:"cronJobs"`
+	StatefulSets map[string]*api.StatefulSet              `json:"statefulSets"`
+	Ingresses    map[string]*api.Ingress                  `json:"ingresses"`
+	Tokens       map[string]*api.Token                    `json:"tokens"` // by token id
+	DaemonSets   map[string]*api.DaemonSet                `json:"daemonSets"`
+	Policies     map[string]*api.NetworkPolicy            `json:"networkPolicies"`
+	CRDs         map[string]*api.CustomResourceDefinition `json:"crds"`   // by kind
+	Custom       map[string]*api.CustomObject             `json:"custom"` // by "Kind|ns/name"
+	Snapshots    map[string]*api.VolumeSnapshot           `json:"snapshots"`
+	ACME         map[string][]byte                        `json:"acme"`     // certificate cache shared by all servers
+	Revision     int64                                    `json:"revision"` // bumped on custom-object changes (watch)
+	Servers      map[string]*api.ServerMember             `json:"servers"`
 	// Cluster certificate authority (PEM), created once by the first leader.
 	// It signs every server and agent certificate; clients pin its hash.
 	CACert   string      `json:"caCert,omitempty"`
@@ -84,6 +92,24 @@ func (s *State) init() {
 	}
 	if s.Tokens == nil {
 		s.Tokens = map[string]*api.Token{}
+	}
+	if s.DaemonSets == nil {
+		s.DaemonSets = map[string]*api.DaemonSet{}
+	}
+	if s.Policies == nil {
+		s.Policies = map[string]*api.NetworkPolicy{}
+	}
+	if s.CRDs == nil {
+		s.CRDs = map[string]*api.CustomResourceDefinition{}
+	}
+	if s.Custom == nil {
+		s.Custom = map[string]*api.CustomObject{}
+	}
+	if s.Snapshots == nil {
+		s.Snapshots = map[string]*api.VolumeSnapshot{}
+	}
+	if s.ACME == nil {
+		s.ACME = map[string][]byte{}
 	}
 }
 
@@ -165,6 +191,15 @@ func (s *State) Namespaces() []string {
 	for _, v := range s.Ingresses {
 		set[v.Metadata.Namespace] = true
 	}
+	for _, v := range s.DaemonSets {
+		set[v.Metadata.Namespace] = true
+	}
+	for _, v := range s.Policies {
+		set[v.Metadata.Namespace] = true
+	}
+	for _, v := range s.Custom {
+		set[v.Metadata.Namespace] = true
+	}
 	out := make([]string, 0, len(set))
 	for k := range set {
 		out = append(out, k)
@@ -186,4 +221,23 @@ type Store interface {
 	AddServer(id, raftAddr, apiAddr string) error
 	RemoveServer(id string) error
 	Close() error
+}
+
+// CustomKey is the store key of a custom object.
+func CustomKey(kind, ns, name string) string { return kind + "|" + ns + "/" + name }
+
+// CRDByName finds a CRD by kind, plural or short name (case-insensitive).
+func (s *State) CRDByName(name string) *api.CustomResourceDefinition {
+	n := strings.ToLower(name)
+	for _, c := range s.CRDs {
+		if strings.ToLower(c.Spec.Kind) == n || c.Spec.Plural == n {
+			return c
+		}
+		for _, sn := range c.Spec.ShortNames {
+			if sn == n {
+				return c
+			}
+		}
+	}
+	return nil
 }

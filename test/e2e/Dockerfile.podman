@@ -1,0 +1,8 @@
+# Test-only image: a node running Podman (Docker-compatible API) + nube agent.
+FROM alpine:3.20
+RUN apk add --no-cache podman catatonit iptables ip6tables iproute2 wireguard-tools e2fsprogs e2fsprogs-extra util-linux nfs-utils curl \
+ && printf '[storage]\ndriver = "vfs"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' > /etc/containers/storage.conf
+COPY nube /usr/local/bin/nube
+COPY podman-entry.sh /podman-entry.sh
+RUN chmod +x /podman-entry.sh /usr/local/bin/nube
+ENTRYPOINT ["/podman-entry.sh"]

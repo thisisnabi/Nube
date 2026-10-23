@@ -13,8 +13,9 @@ const S = {
 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const VIEWS = {
-  overview: 'Overview', nodes: 'Nodes', deployments: 'Deployments', statefulsets: 'StatefulSets', jobs: 'Jobs & CronJobs',
-  pods: 'Pods', services: 'Services', ingresses: 'Ingress', volumes: 'Volumes', config: 'Config & Secrets',
+  overview: 'Overview', nodes: 'Nodes', deployments: 'Deployments', statefulsets: 'StatefulSets', daemonsets: 'DaemonSets',
+  jobs: 'Jobs & CronJobs', pods: 'Pods', services: 'Services', ingresses: 'Ingress', policies: 'Network policies',
+  volumes: 'Volumes & snapshots', config: 'Config & Secrets', custom: 'Custom resources',
   events: 'Events', tokens: 'Access tokens', cluster: 'Control Plane', apply: 'Apply YAML',
 };
 // Views with form inputs are rendered once, not on every poll.
@@ -403,8 +404,81 @@ const renderers = {
           <td>${esc(v.status.nodeName || (v.spec.type === 'local' ? 'unbound' : 'any'))}</td>
           <td>${(v.status.usedBy || []).map(esc).join('<br>') || '—'}</td>
           <td class="mono small">${esc(src)}</td>
-          <td class="actions"><button class="btn small danger" data-delete="volumes|${id}">Delete</button></td></tr>`;
-      }), 'No volumes. Create one with <code>kind: Volume</code> (local, nfs or hostPath).'));
+          <td class="actions btn-row" style="justify-content:flex-end">
+            ${v.status.migration ? chip('moving: ' + v.status.migration.phase, 'info', true) : ''}
+            <button class="btn small" data-snapshot="${id}" title="Copy the data to the control plane">Snapshot</button>
+            ${v.spec.type === 'local' && v.status.nodeName ? `<select class="small" data-move="${id}"><option value="">Move to…</option>${
+              d.nodes.filter(n => n.name !== v.status.nodeName && n.status === 'Ready').map(n => `<option>${esc(n.name)}</option>`).join('')}</select>` : ''}
+            <button class="btn small danger" data-delete="volumes|${id}">Delete</button></td></tr>`;
+      }), 'No volumes. Create one with <code>kind: Volume</code> (local, nfs or hostPath).')) +
+      card(`Snapshots <span class="muted">(${d.snapshots.filter(inNS).length})</span>`, table(['Name', 'Volume', 'Status', 'Size', 'Taken', 'Copies', ''],
+        d.snapshots.filter(inNS).slice().reverse().map(s => {
+          const id = `${esc(s.metadata.namespace)}|${esc(s.metadata.name)}`;
+          const kind = s.metadata.labels && s.metadata.labels['nube/backup'] ? ' <span class="tag">backup</span>' : s.metadata.labels && s.metadata.labels['nube/migration'] ? ' <span class="tag">move</span>' : '';
+          return `<tr><td class="name"><a data-describe="volumesnapshots|${id}">${esc(s.metadata.name)}</a>${kind}<div class="sub">${esc(s.metadata.namespace)}</div></td>
+            <td>${esc(s.spec.volume)}</td>
+            <td>${chip(s.status.phase, { Ready: 'ok', Failed: 'bad' }[s.status.phase] || 'info', s.status.phase === 'Pending')}${s.status.message ? `<div class="sub">${esc(s.status.message)}</div>` : ''}</td>
+            <td>${s.status.sizeBytes ? fmtMem(Math.max(1, Math.round(s.status.sizeBytes / 1048576))) : '—'}</td>
+            <td>${s.status.takenAt && !s.status.takenAt.startsWith('0001') ? ago(s.status.takenAt) + ' ago' : '—'}</td>
+            <td title="${esc((s.status.storedOn || []).join(', '))}">${(s.status.storedOn || []).length} server(s)</td>
+            <td class="actions btn-row" style="justify-content:flex-end">
+              ${s.status.phase === 'Ready' ? `<a class="btn small" data-download="${id}">Download</a>` : ''}
+              <button class="btn small danger" data-delete="volumesnapshots|${id}">Delete</button></td></tr>`;
+        }), 'No snapshots. Snapshots are stored on the control plane, so they survive the loss of a node.'));
+  },
+
+  daemonsets(d) {
+    const list = d.daemonSets.filter(inNS);
+    return card(`DaemonSets <span class="muted">(${list.length})</span>`, table(['Name', 'Nodes ready', 'Status', 'Image', 'Node selector', ''],
+      list.map(x => {
+        const id = `${esc(x.metadata.namespace)}|${esc(x.metadata.name)}`;
+        return `<tr><td class="name"><a data-describe="daemonsets|${id}">${esc(x.metadata.name)}</a><div class="sub">${esc(x.metadata.namespace)}</div></td>
+          <td>${x.status.numberReady}/${x.status.desiredNumberScheduled}</td>
+          <td>${deployChip(x)}${x.status.message ? `<div class="sub">${esc(x.status.message)}</div>` : ''}</td>
+          <td class="mono trunc">${esc(mainImage(x.spec.template))}</td>
+          <td>${labels(x.spec.nodeSelector) || '<span class="muted small">all nodes</span>'}</td>
+          <td class="actions"><button class="btn small danger" data-delete="daemonsets|${id}">Delete</button></td></tr>`;
+      }), 'No daemonsets. A DaemonSet runs one pod on every (matching) node — log shippers, monitoring agents…'));
+  },
+
+  policies(d) {
+    const list = d.networkPolicies.filter(inNS);
+    const peers = (rules, dir) => (rules || []).map(r => {
+      const ps = (dir === 'from' ? r.from : r.to) || [];
+      const who = ps.length ? ps.map(p => p.ipBlock ? esc(p.ipBlock.cidr) : (labels((p.podSelector || {}).matchLabels) || 'all pods') +
+        (p.namespaces ? ' in ' + esc(p.namespaces.join(',')) : '')).join(', ') : 'anywhere';
+      const ports = (r.ports || []).map(p => (p.port || 'all') + '/' + (p.protocol || 'TCP')).join(', ') || 'all ports';
+      return `<div class="small">${who} → ${esc(ports)}</div>`;
+    }).join('') || '<div class="small muted">deny all</div>';
+    return card(`Network policies <span class="muted">(${list.length})</span>`, table(['Name', 'Applies to', 'Ingress allowed', 'Egress allowed', 'Pods', ''],
+      list.map(np => {
+        const id = `${esc(np.metadata.namespace)}|${esc(np.metadata.name)}`;
+        const types = np.spec.policyTypes || [];
+        return `<tr><td class="name"><a data-describe="networkpolicies|${id}">${esc(np.metadata.name)}</a><div class="sub">${esc(np.metadata.namespace)}</div></td>
+          <td>${labels(np.spec.podSelector.matchLabels) || 'all pods'}</td>
+          <td>${types.includes('Ingress') ? peers(np.spec.ingress, 'from') : '<span class="muted small">not restricted</span>'}</td>
+          <td>${types.includes('Egress') ? peers(np.spec.egress, 'to') : '<span class="muted small">not restricted</span>'}</td>
+          <td>${np.status.selectedPods}</td>
+          <td class="actions"><button class="btn small danger" data-delete="networkpolicies|${id}">Delete</button></td></tr>`;
+      }), 'No network policies: every pod can reach every other pod. A policy isolates the pods it selects.'));
+  },
+
+  custom(d) {
+    if (!d.crds.length) return card('Custom resources', '<div class="empty">No custom resource definitions. Register one with <code>kind: CustomResourceDefinition</code> and run an operator for it.</div>');
+    return d.crds.map(crd => {
+      const objs = d.custom.filter(o => o.kind === crd.spec.kind).filter(inNS);
+      const cols = crd.spec.printerColumns || [];
+      const val = (o, path) => { let v = o; for (const p of path.split('.')) v = v == null ? v : v[p]; return v == null ? '—' : esc(typeof v === 'object' ? JSON.stringify(v) : v); };
+      return card(`${esc(crd.spec.kind)} <span class="muted">(${objs.length}) · ${esc(crd.spec.plural)}</span>`,
+        table(['Name', ...cols.map(c => esc(c.name)), 'Synced', 'Age', ''], objs.map(o => {
+          const id = `${esc(o.metadata.namespace)}|${esc(o.metadata.name)}`;
+          return `<tr><td class="name"><a data-describe="custom:${esc(o.kind)}|${id}">${esc(o.metadata.name)}</a><div class="sub">${esc(o.metadata.namespace)}</div></td>
+            ${cols.map(c => `<td>${val(o, c.path)}</td>`).join('')}
+            <td>${o.observedGeneration >= o.generation ? chip('yes', 'ok') : chip('waiting for operator', 'warn', true)}</td>
+            <td>${ago(o.metadata.createdAt)}</td>
+            <td class="actions"><button class="btn small danger" data-delete="${esc(crd.spec.plural)}|${id}">Delete</button></td></tr>`;
+        }), `No ${esc(crd.spec.plural)} yet.`), crd.spec.description ? `<span class="muted small">${esc(crd.spec.description)}</span>` : '');
+    }).join('');
   },
 
   config(d) {
@@ -546,7 +620,8 @@ function nodeCard(n, full) {
       <dt>Network</dt><dd>${net} <span class="mono small muted">${esc(n.podCIDR || '')}</span>${n.networkError ? `<div class="small" style="color:var(--bad)">${esc(n.networkError)}</div>` : ''}</dd>
       ${full ? `<dt>OS</dt><dd>${esc(n.info.os)} · ${esc(n.info.arch)}</dd>
       <dt>Kernel</dt><dd>${esc(n.info.kernel)}</dd>
-      <dt>Runtime</dt><dd>docker ${esc(n.info.runtimeVersion)}</dd>
+      <dt>Runtime</dt><dd>${esc(n.info.runtime || 'docker')} ${esc(n.info.runtimeVersion)}</dd>
+      <dt>Services</dt><dd>${esc(n.firewall || '—')}</dd>
       <dt>Agent</dt><dd>${esc(n.info.agentVersion)}</dd>
       <dt>Heartbeat</dt><dd>${ago(n.lastHeartbeat)} ago</dd>
       <dt>Labels</dt><dd>${labels(n.labels)}</dd>` : `<dt>Heartbeat</dt><dd>${ago(n.lastHeartbeat)} ago</dd>`}
@@ -567,6 +642,16 @@ function eventRow(e) {
 }
 
 // ------------------------------------------------------------ actions (event delegation)
+
+$('#view').addEventListener('change', e => {
+  const sel = e.target.closest('select[data-move]');
+  if (!sel || !sel.value) return;
+  const [ns, name] = sel.dataset.move.split('|');
+  if (confirm(`Move volume "${name}" to ${sel.value}? Pods using it stop until the data is copied.`)) {
+    act(post(objPath('volumes', ns, name) + '/move', { node: sel.value }));
+  }
+  sel.value = '';
+});
 
 $('#view').addEventListener('click', async e => {
   const t = e.target.closest('button, a');
@@ -607,6 +692,19 @@ $('#view').addEventListener('click', async e => {
       await act(del('/api/v1/tokens/' + encodeURIComponent(ds.tokenDelete)));
       if (S.reloadTokens) S.reloadTokens();
     }
+  } else if (ds.snapshot) {
+    const [ns, name] = ds.snapshot.split('|');
+    const snap = name + '-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    act(api('/api/v1/apply', { method: 'POST', headers: { 'Content-Type': 'application/yaml' },
+      body: `kind: VolumeSnapshot\nmetadata: {name: ${snap}, namespace: ${ns}}\nspec: {volume: ${name}}\n` }), 'Snapshot requested');
+  } else if (ds.download) {
+    const [ns, name] = ds.download.split('|');
+    const res = await api(objPath('volumesnapshots', ns, name) + '/data', { raw: true });
+    if (!res.ok) { toast('Download failed: ' + res.statusText, true); return; }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a');
+    a.href = url; a.download = name + '.tar.gz'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   } else if (ds.logs) {
     showLogs(...ds.logs.split('|'));
   } else if (ds.describe) {
@@ -631,15 +729,18 @@ const KINDS = {
   deployments: ['deployments', 'Deployment'], statefulsets: ['statefulSets', 'StatefulSet'], jobs: ['jobs', 'Job'],
   cronjobs: ['cronJobs', 'CronJob'], pods: ['pods', 'Pod'], services: ['services', 'Service'], ingresses: ['ingresses', 'Ingress'],
   volumes: ['volumes', 'Volume'], configmaps: ['configMaps', 'ConfigMap'], secrets: ['secrets', 'Secret'],
+  daemonsets: ['daemonSets', 'DaemonSet'], networkpolicies: ['networkPolicies', 'NetworkPolicy'],
+  volumesnapshots: ['snapshots', 'VolumeSnapshot'], custom: ['custom', ''],
 };
 function findObj(kind, ns, name) {
   return (S.data[KINDS[kind][0]] || []).find(o => o.metadata.namespace === ns && o.metadata.name === name);
 }
 
 function showDescribe(kind, ns, name) {
-  const obj = findObj(kind, ns, name);
+  const obj = kind.startsWith('custom:') ? S.data.custom.find(o => o.kind === kind.slice(7) && o.metadata.namespace === ns && o.metadata.name === name)
+    : findObj(kind, ns, name);
   if (!obj) return;
-  const singular = KINDS[kind][1];
+  const singular = kind.startsWith('custom:') ? kind.slice(7) : KINDS[kind][1];
   const owner = ['deployments', 'statefulsets', 'jobs'].includes(kind);
   const evs = S.data.events.filter(e => (e.kind === singular && e.name === name) ||
     (owner && e.kind === 'Pod' && e.name.startsWith(name + '-'))).slice(-15).reverse();
@@ -718,6 +819,55 @@ async function showLogs(ns, name) {
 // ------------------------------------------------------------ templates
 
 const TEMPLATES = {
+  'DaemonSet (per node)': `kind: DaemonSet
+metadata:
+  name: node-logger
+spec:
+  template:
+    image: busybox:1.36
+    command: ["sh", "-c", "while true; do echo \\"hello from $NUBE_NODE_NAME\\"; sleep 30; done"]
+`,
+  'Network policy': `# Only pods labelled role=frontend may reach the database, on port 5432.
+kind: NetworkPolicy
+metadata:
+  name: db-access
+spec:
+  podSelector: { matchLabels: { app: postgres } }
+  ingress:
+    - from: [{ podSelector: { matchLabels: { role: frontend } } }]
+      ports: [{ port: 5432 }]
+`,
+  'Backed-up volume': `kind: Volume
+metadata:
+  name: data
+spec:
+  type: local
+  size: 5Gi
+  backup: { schedule: "0 3 * * *", keep: 7 }   # nightly snapshots on the control plane
+  autoRecover: true                           # restore elsewhere if the node dies
+`,
+  'Custom resource (CRD)': `kind: CustomResourceDefinition
+metadata:
+  name: websites
+spec:
+  kind: Website
+  plural: websites
+  schema:
+    type: object
+    required: [image]
+    properties:
+      image: { type: string }
+      replicas: { type: integer, minimum: 1, default: 2 }
+  printerColumns:
+    - { name: image, path: spec.image }
+    - { name: phase, path: status.phase }
+---
+kind: Website
+metadata:
+  name: blog
+spec:
+  image: nginx:alpine
+`,
   'Sidecar + init container': `kind: Deployment
 metadata:
   name: blog

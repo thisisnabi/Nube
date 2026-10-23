@@ -1,0 +1,23 @@
+# Registers the Website kind. The operator (main.go in this folder) turns each
+# Website into a Deployment, a Service and optionally an Ingress.
+kind: CustomResourceDefinition
+metadata:
+  name: websites
+spec:
+  kind: Website
+  plural: websites
+  shortNames: [web, ws]
+  description: A static or containerised website
+  schema:
+    type: object
+    required: [image]
+    properties:
+      image:    { type: string, description: container image to serve }
+      replicas: { type: integer, minimum: 1, maximum: 20, default: 2 }
+      port:     { type: integer, default: 80 }
+      host:     { type: string, description: public host name (creates an Ingress) }
+  printerColumns:
+    - { name: image, path: spec.image }
+    - { name: replicas, path: spec.replicas }
+    - { name: phase, path: status.phase }
+    - { name: ready, path: status.readyReplicas }

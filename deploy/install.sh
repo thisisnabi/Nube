@@ -14,6 +14,9 @@
 #   --network MODE     pod overlay for agents: wireguard (default) | host-gw | none
 #   --name NAME        node name (default: hostname)
 #   --labels k=v,...   node labels
+#   --runtime NAME     container runtime for agents: docker (default) | podman
+#   --acme-email ADDR  get Let's Encrypt certificates for Ingress hosts with "acme: true"
+#   --acme-domain HOST also serve the API/dashboard with a Let's Encrypt certificate for HOST
 #   --no-tls           serve the API over plain HTTP (not recommended)
 #   --no-ingress       do not listen on ports 80/443 for Ingress
 #   --no-packages      do not apt-get install dependencies
@@ -22,6 +25,7 @@ set -euo pipefail
 ROLE="${1:-}"; shift || true
 BINARY="" IP="" TOKEN="" SERVER="" NETWORK="wireguard" NAME="" LABELS="" CA_HASH=""
 HA=false ID="" BOOTSTRAP=false JOIN="" PACKAGES=true TLS=true INGRESS=true
+RUNTIME=docker ACME_EMAIL="" ACME_DOMAIN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,10 +41,13 @@ while [[ $# -gt 0 ]]; do
     --id) ID="$2"; shift 2 ;;
     --bootstrap) BOOTSTRAP=true; shift ;;
     --join) JOIN="$2"; shift 2 ;;
+    --runtime) RUNTIME="$2"; shift 2 ;;
+    --acme-email) ACME_EMAIL="$2"; shift 2 ;;
+    --acme-domain) ACME_DOMAIN="$2"; shift 2 ;;
     --no-tls) TLS=false; shift ;;
     --no-ingress) INGRESS=false; shift ;;
     --no-packages) PACKAGES=false; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -50,7 +57,9 @@ warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "run as root (sudo bash $0 ...)"
-case "$ROLE" in single|server|agent|uninstall) ;; *) sed -n '2,22p' "$0"; exit 2 ;; esac
+case "$ROLE" in single|server|agent|uninstall) ;; *) sed -n '2,25p' "$0"; exit 2 ;; esac
+case "$RUNTIME" in docker|podman) ;; *) die "--runtime must be docker or podman" ;; esac
+if [[ -n "$ACME_DOMAIN" && -z "$ACME_EMAIL" ]]; then die "--acme-domain needs --acme-email"; fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCHEME=https
@@ -64,7 +73,7 @@ if [[ "$ROLE" == uninstall ]]; then
   ip link del nube-wg 2>/dev/null || true
   say "removed binary and services. Kept data and config:"
   echo "    /etc/nube  /var/lib/nube  /var/lib/nube-agent"
-  echo "  Containers started by Nube keep running; list them with: docker ps --filter label=nube.managed=true"
+  echo "  Containers started by Nube keep running; list them with: docker ps --filter label=nube.managed=true (or podman ps)"
   exit 0
 fi
 
@@ -84,17 +93,24 @@ say "installed /usr/local/bin/nube"
 need_agent=false
 if [[ "$ROLE" == agent || "$ROLE" == single ]]; then need_agent=true; fi
 if $PACKAGES && $need_agent; then
-  say "installing dependencies (docker, wireguard, iptables, nfs, e2fsprogs)"
+  say "installing dependencies ($RUNTIME, wireguard, iptables, nfs, e2fsprogs)"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   pkgs=(iptables iproute2 nfs-common ca-certificates curl e2fsprogs util-linux mount)
   if [[ "$NETWORK" == wireguard ]]; then pkgs+=(wireguard-tools); fi
-  if ! command -v docker >/dev/null; then pkgs+=(docker.io); fi
+  if [[ "$RUNTIME" == docker ]] && ! command -v docker >/dev/null; then pkgs+=(docker.io); fi
+  if [[ "$RUNTIME" == podman ]] && ! command -v podman >/dev/null; then pkgs+=(podman); fi
   apt-get install -y -qq "${pkgs[@]}" >/dev/null
-  systemctl enable --now docker >/dev/null
 fi
 if $need_agent; then
-  command -v docker >/dev/null || die "docker is required on agents (apt install docker.io)"
+  if [[ "$RUNTIME" == docker ]]; then
+    command -v docker >/dev/null || die "docker is required on agents (apt install docker.io)"
+    systemctl enable --now docker >/dev/null
+  else
+    command -v podman >/dev/null || die "podman is required on agents (apt install podman)"
+    # Podman's Docker-compatible API on /run/podman/podman.sock.
+    systemctl enable --now podman.socket >/dev/null
+  fi
   if [[ "$NETWORK" == wireguard ]]; then
     # Built-in or loadable, the reliable test is creating an interface.
     modprobe wireguard 2>/dev/null || true
@@ -144,6 +160,8 @@ if [[ "$ROLE" == single || "$ROLE" == server ]]; then
     echo "NUBE_TLS=$TLS"
     echo "NUBE_TLS_SAN=$IP"
     if ! $INGRESS; then echo "NUBE_INGRESS_HTTP=off"; echo "NUBE_INGRESS_HTTPS=off"; fi
+    if [[ -n "$ACME_EMAIL" ]]; then echo "NUBE_ACME_EMAIL=$ACME_EMAIL"; fi
+    if [[ -n "$ACME_DOMAIN" ]]; then echo "NUBE_ACME_DOMAIN=$ACME_DOMAIN"; fi
     if $HA; then
       echo "NUBE_HA=true"
       echo "NUBE_SERVER_ID=$ID"
@@ -204,7 +222,7 @@ if $need_agent; then
   AGENT_TOKEN="$TOKEN"
   if [[ "$ROLE" == single ]]; then AGENT_TOKEN="$NODE_TOKEN"; fi
   [[ -n "$AGENT_TOKEN" ]] || die "no token for the agent"
-  say "configuring node agent ($NETWORK network)"
+  say "configuring node agent ($RUNTIME, $NETWORK network)"
   {
     echo "NUBE_SERVER=$SERVER"
     echo "NUBE_TOKEN=$AGENT_TOKEN"
@@ -212,6 +230,7 @@ if $need_agent; then
     echo "NUBE_NODE_NAME=$NAME"
     echo "NUBE_ADVERTISE_IP=$IP"
     echo "NUBE_NETWORK=$NETWORK"
+    echo "NUBE_RUNTIME=$RUNTIME"
     if [[ -n "$LABELS" ]]; then echo "NUBE_LABELS=$LABELS"; fi
   } > /etc/nube/agent.env
   chmod 600 /etc/nube/agent.env
@@ -234,6 +253,9 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 UNIT
+  if [[ "$RUNTIME" == podman ]]; then
+    sed -i 's/docker\.service/podman.socket/g' /etc/systemd/system/nube-agent.service
+  fi
   systemctl daemon-reload
   systemctl enable nube-agent.service >/dev/null
   systemctl restart nube-agent.service
@@ -253,6 +275,9 @@ say "done"
 if [[ "$ROLE" != agent ]]; then
   echo "  Dashboard:   $SCHEME://$IP:7070/   (sign in with the admin token)"
   echo "  Admin token: in /var/lib/nube/token"
+  if [[ -n "$ACME_DOMAIN" ]]; then
+    echo "  Public URL:  https://$ACME_DOMAIN:7070/   (Let's Encrypt; DNS must point here and port 443 or 80 must be reachable)"
+  fi
   if [[ -n "$CA_HASH" ]]; then
     echo "  Cluster CA:  $CA_HASH"
     echo "               download $SCHEME://$IP:7070/ca.crt and import it in your browser to avoid the warning"
@@ -261,7 +286,7 @@ if [[ "$ROLE" != agent ]]; then
   if [[ -n "$NODE_TOKEN" ]]; then
     echo
     echo "  Add a worker node (run on the other machine):"
-    echo "    sudo bash install.sh agent --server $SCHEME://$IP:7070 --token $NODE_TOKEN${CA_HASH:+ --ca-hash $CA_HASH}"
+    echo "    sudo bash install.sh agent --server $SCHEME://$IP:7070 --token $NODE_TOKEN${CA_HASH:+ --ca-hash $CA_HASH}   [--runtime podman]"
   fi
   if $HA && $BOOTSTRAP; then
     echo

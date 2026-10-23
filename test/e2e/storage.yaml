@@ -1,0 +1,20 @@
+# Snapshot, backup, move and recovery checks.
+kind: Volume
+metadata: { name: cache-data }
+spec:
+  type: local
+  size: 128Mi
+  backup: { schedule: "* * * * *", keep: 2 }
+  autoRecover: true
+---
+kind: Deployment
+metadata: { name: cache }
+spec:
+  replicas: 1
+  strategy: { maxSurge: 0, maxUnavailable: 1 }
+  template:
+    image: redis:7-alpine
+    args: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    ports: [{ containerPort: 6379 }]
+    volumes: [{ volume: cache-data, containerPath: /data }]
+    healthCheck: { tcpSocket: { port: 6379 } }

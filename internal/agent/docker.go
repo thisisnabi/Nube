@@ -20,6 +20,7 @@ import (
 
 // Docker is a minimal Docker Engine API client (no external dependencies).
 type Docker struct {
+	Podman bool // the endpoint is Podman's Docker-compatible API (libpod API also available)
 	base   string
 	client *http.Client // short requests
 	stream *http.Client // pulls, logs (no timeout)
@@ -520,6 +521,7 @@ type NetworkInfo struct {
 	Subnet  string
 	Gateway string
 	Count   int
+	DNS     bool // Podman runs its own DNS server (aardvark-dns) on the gateway
 }
 
 func (d *Docker) InspectNetwork(ctx context.Context, name string) (*NetworkInfo, error) {
@@ -541,10 +543,32 @@ func (d *Docker) InspectNetwork(ctx context.Context, name string) (*NetworkInfo,
 	if len(v.IPAM.Config) > 0 {
 		ni.Subnet, ni.Gateway = v.IPAM.Config[0].Subnet, v.IPAM.Config[0].Gateway
 	}
+	if d.Podman {
+		var lp struct {
+			DNSEnabled bool `json:"dns_enabled"`
+		}
+		if err := d.call(ctx, "GET", "/v4.0.0/libpod/networks/"+url.PathEscape(name)+"/json", nil, &lp); err != nil {
+			return nil, err
+		}
+		ni.DNS = lp.DNSEnabled
+	}
 	return ni, nil
 }
 
 func (d *Docker) CreateNetwork(ctx context.Context, name, subnet, gateway string, opts map[string]string) error {
+	if d.Podman {
+		// Through the libpod API: the compat API always enables Podman's DNS
+		// server, which would take the gateway's port 53 from the cluster DNS.
+		body := map[string]any{
+			"name":              name,
+			"driver":            "bridge",
+			"network_interface": opts["com.docker.network.bridge.name"],
+			"subnets":           []map[string]string{{"subnet": subnet, "gateway": gateway}},
+			"dns_enabled":       false,
+			"labels":            map[string]string{"nube.managed": "true"},
+		}
+		return d.call(ctx, "POST", "/v4.0.0/libpod/networks/create", body, nil)
+	}
 	body := map[string]any{
 		"Name":           name,
 		"Driver":         "bridge",
@@ -625,6 +649,15 @@ func (d *Docker) RemoveVolume(ctx context.Context, name string) error {
 		return nil
 	}
 	return err
+}
+
+// VolumeMountpoint returns the host directory of a Docker volume.
+func (d *Docker) VolumeMountpoint(ctx context.Context, name string) (string, error) {
+	var v struct{ Mountpoint string }
+	if err := d.call(ctx, "GET", "/volumes/"+url.PathEscape(name), nil, &v); err != nil {
+		return "", err
+	}
+	return v.Mountpoint, nil
 }
 
 // VolumeExists reports whether a Docker volume exists.

@@ -41,6 +41,13 @@ func (s *Server) controllerLoop(ctx context.Context) {
 		if !wasLeader {
 			wasLeader = true
 			log.Printf("controllers: this server is the leader")
+			var names []string
+			s.store.Read(func(st *store.State) {
+				for n := range st.Nodes {
+					names = append(names, n)
+				}
+			})
+			s.live.grace(names, time.Now()) // no live heartbeats yet: don't evict everything
 			s.ensureMembership()
 			if s.cfg.TLS {
 				s.ensureCA()
@@ -52,12 +59,12 @@ func (s *Server) controllerLoop(ctx context.Context) {
 		}
 		err := s.store.Write(func(st *store.State) error {
 			now := time.Now()
-			reconcileNodes(st, now)
+			reconcileNodes(st, now, s.live.lastSeen)
 			reconcileTerminating(st, now)
 			for _, key := range sortedKeys(st.Deployments) {
 				d := st.Deployments[key]
 				if doAutoscale {
-					autoscale(st, d, now)
+					autoscale(st, d, now, func(p *api.Pod) int64 { return s.live.podCPU(p.Metadata.Key()) })
 				}
 				reconcileDeployment(st, d, now)
 			}
@@ -72,11 +79,19 @@ func (s *Server) controllerLoop(ctx context.Context) {
 			for _, key := range sortedKeys(st.StatefulSets) {
 				reconcileStatefulSet(st, st.StatefulSets[key], now)
 			}
+			for _, key := range sortedKeys(st.DaemonSets) {
+				reconcileDaemonSet(st, st.DaemonSets[key], now)
+			}
+			reconcileBackups(st, now)
+			reconcileSnapshots(st, now)
+			reconcileMigrations(st, now, s.live.lastSeen)
 			schedulePending(st, now)
 			computeAllocations(st)
 			reconcileVolumes(st)
 			reconcileServiceStatus(st)
 			reconcileIngressStatus(st)
+			countCRDObjects(st)
+			countPolicyPods(st)
 			return nil
 		})
 		if err != nil && err != store.ErrNotLeader {
@@ -113,9 +128,15 @@ func sortedKeys[T any](m map[string]T) []string {
 
 // ---------------------------------------------------------------- nodes
 
-func reconcileNodes(st *store.State, now time.Time) {
+// reconcileNodes marks silent nodes NotReady and evicts their pods. seen
+// returns a node's last heartbeat (nil: the persisted one).
+func reconcileNodes(st *store.State, now time.Time, seen func(*api.Node) time.Time) {
 	for _, n := range st.Nodes {
-		silent := now.Sub(n.LastHeartbeat)
+		last := n.LastHeartbeat
+		if seen != nil {
+			last = seen(n)
+		}
+		silent := now.Sub(last)
 		if n.Status == api.NodeReady && silent > nodeHeartbeatTimeout {
 			n.Status = api.NodeNotReady
 			st.Event("Warning", api.KindNode, "", n.Name, "NodeNotReady", fmt.Sprintf("no heartbeat for %s", silent.Round(time.Second)))
@@ -209,7 +230,10 @@ func pickNode(st *store.State, p *api.Pod) (*api.Node, string) {
 		if v == nil {
 			return nil, fmt.Sprintf("volume %q not found", vm.Volume)
 		}
-		if v.Spec.Type != "local" {
+		if m := v.Status.Migration; m != nil && (m.Phase == "Draining" || m.Phase == "Snapshotting") {
+			return nil, fmt.Sprintf("volume %q is being moved to %s", vm.Volume, m.Target)
+		}
+		if !nodeBound(v) {
 			continue
 		}
 		bound := v.Status.NodeName
@@ -313,7 +337,7 @@ func bindPod(st *store.State, p *api.Pod, n *api.Node, now time.Time) {
 	n.Allocated.CPU += r.CPU
 	n.Allocated.Memory += r.Memory
 	for _, vm := range p.Spec.Template.AllVolumeMounts() {
-		if v := st.Volumes[p.Metadata.Namespace+"/"+vm.Volume]; v != nil && v.Spec.Type == "local" && v.Status.NodeName == "" {
+		if v := st.Volumes[p.Metadata.Namespace+"/"+vm.Volume]; v != nil && nodeBound(v) && v.Status.NodeName == "" {
 			v.Status.NodeName, v.Status.Phase = n.Name, "Bound"
 			st.Event("Normal", api.KindVolume, v.Metadata.Namespace, v.Metadata.Name, "Bound", "local volume bound to node "+n.Name)
 		}
@@ -504,7 +528,7 @@ func firstNonEmpty(a, b string) string {
 
 // autoscale adjusts replicas so that average CPU use per pod approaches
 // targetCPUPercent of its CPU request (the same formula as the Kubernetes HPA).
-func autoscale(st *store.State, d *api.Deployment, now time.Time) {
+func autoscale(st *store.State, d *api.Deployment, now time.Time, cpu func(*api.Pod) int64) {
 	a := d.Spec.Autoscale
 	if a == nil {
 		return
@@ -517,7 +541,11 @@ func autoscale(st *store.State, d *api.Deployment, now time.Time) {
 	ready := 0
 	for _, p := range st.PodsOf(d.Metadata.Namespace, d.Metadata.Name) {
 		if p.Status.Ready && p.Status.Phase != api.PodTerminating {
-			used += p.Status.CPU
+			if cpu != nil {
+				used += cpu(p)
+			} else {
+				used += p.Status.CPU
+			}
 			ready++
 		}
 	}
@@ -550,12 +578,27 @@ func autoscale(st *store.State, d *api.Deployment, now time.Time) {
 
 // ---------------------------------------------------------------- volumes & services
 
+// nodeBound reports whether a volume can only be used on one node at a time.
+func nodeBound(v *api.Volume) bool {
+	return v.Spec.Type == "local" || (v.Spec.Type == "nfs" && v.Spec.AccessMode == "ReadWriteOnce")
+}
+
 func reconcileVolumes(st *store.State) {
 	for _, v := range st.Volumes {
 		users := volumeUsers(st, v.Metadata.Namespace, v.Metadata.Name)
 		sort.Strings(users)
 		v.Status.UsedBy = users
-		if v.Spec.Type != "local" {
+		switch {
+		case v.Spec.Type == "nfs" && v.Spec.AccessMode == "ReadWriteOnce":
+			// Released once unused, so the next pod may run on any node; ext4
+			// multi-mount protection guards against two nodes mounting it.
+			// Pending replacements don't hold it: only pods placed on a node do.
+			if !volumeBusy(st, v.Metadata.Namespace, v.Metadata.Name) {
+				v.Status.NodeName, v.Status.Phase = "", "Available"
+			} else if v.Status.NodeName != "" {
+				v.Status.Phase = "Bound"
+			}
+		case v.Spec.Type != "local":
 			if len(users) > 0 {
 				v.Status.Phase = "Bound"
 			} else {

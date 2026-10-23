@@ -41,6 +41,7 @@ type Config struct {
 	Listen      string // agent API (logs), e.g. :7071
 	DataDir     string
 	DockerHost  string
+	Runtime     string // docker | podman (both through the Docker-compatible API)
 	Labels      map[string]string
 	NetworkMode string // wireguard | host-gw | none
 	WGPort      int
@@ -61,24 +62,30 @@ type Agent struct {
 	dns    *dnsServer
 	svc    *proxy.Manager
 	sized  *sizedVolumes
+	fw     *firewall
 	http   *http.Client
 	cpu    cpuSampler
 	info   RuntimeInfo
 	tls    bool // the control plane uses HTTPS
 
-	mu       sync.Mutex
-	pods     map[string]*podState // by pod UID
-	desired  map[string]api.AssignedPod
-	domain   string
-	synced   bool
-	server   int // index into cfg.Servers currently used
-	lastSync time.Time
-	kick     chan struct{}
-	volumes  map[string]volumeInfo // ns/name -> info
-	caPEM    string
-	cert     *tls.Certificate // agent API certificate, signed by the cluster CA
-	certCh   chan struct{}    // closed once cert is available
-	authOK   map[string]time.Time
+	mu        sync.Mutex
+	pods      map[string]*podState // by pod UID
+	desired   map[string]api.AssignedPod
+	domain    string
+	synced    bool
+	server    int // index into cfg.Servers currently used
+	lastSync  time.Time
+	kick      chan struct{}
+	volumes   map[string]volumeInfo // ns/name -> info
+	caPEM     string
+	cert      *tls.Certificate // agent API certificate, signed by the cluster CA
+	certCh    chan struct{}    // closed once cert is available
+	authOK    map[string]time.Time
+	snapBusy  map[string]bool   // snapshots being taken
+	restored  map[string]string // ns/name -> snapshot restored here (until acknowledged)
+	nfsImages map[string]string // ns/name -> image name of mounted ReadWriteOnce NFS volumes
+	routing   string            // "iptables" or "proxy"
+	fwErr     string
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -113,23 +120,34 @@ func New(cfg Config) (*Agent, error) {
 	if useTLS && cfg.CAHash == "" && !cfg.Insecure {
 		return nil, errors.New("--ca-hash is required for https servers (see /var/lib/nube/ca.hash on a server)")
 	}
+	if cfg.Runtime == "" {
+		cfg.Runtime = "docker"
+	}
+	if cfg.DockerHost == "" && cfg.Runtime == "podman" {
+		cfg.DockerHost = "unix:///run/podman/podman.sock"
+	}
 	d, err := NewDocker(cfg.DockerHost)
 	if err != nil {
 		return nil, err
 	}
+	d.Podman = cfg.Runtime == "podman"
 	a := &Agent{
-		cfg:     cfg,
-		docker:  d,
-		dns:     newDNSServer(),
-		svc:     proxy.NewManager("service-proxy"),
-		sized:   newSizedVolumes(cfg.DataDir),
-		tls:     useTLS,
-		pods:    map[string]*podState{},
-		desired: map[string]api.AssignedPod{},
-		kick:    make(chan struct{}, 1),
-		volumes: map[string]volumeInfo{},
-		certCh:  make(chan struct{}),
-		authOK:  map[string]time.Time{},
+		cfg:       cfg,
+		docker:    d,
+		dns:       newDNSServer(),
+		svc:       proxy.NewManager("service-proxy"),
+		sized:     newSizedVolumes(cfg.DataDir),
+		fw:        &firewall{},
+		snapBusy:  map[string]bool{},
+		restored:  map[string]string{},
+		nfsImages: map[string]string{},
+		tls:       useTLS,
+		pods:      map[string]*podState{},
+		desired:   map[string]api.AssignedPod{},
+		kick:      make(chan struct{}, 1),
+		volumes:   map[string]volumeInfo{},
+		certCh:    make(chan struct{}),
+		authOK:    map[string]time.Time{},
 	}
 	if b, err := os.ReadFile(a.path("ca.crt")); err == nil {
 		a.caPEM = string(b)
@@ -278,12 +296,21 @@ func (a *Agent) nodeReport() api.Node {
 		Capacity: capacity,
 		Usage:    api.Resources{CPU: a.cpu.sample(a.info.NCPU), Memory: memUsedMiB()},
 		Info: api.NodeInfo{
-			OS: a.info.OS, Kernel: a.info.Kernel, Arch: a.info.Arch, Runtime: "docker",
+			OS: a.info.OS, Kernel: a.info.Kernel, Arch: a.info.Arch, Runtime: a.cfg.Runtime,
 			RuntimeVer: a.info.Version, AgentVersion: version.Version + " " + runtime.GOOS + "/" + runtime.GOARCH,
 		},
 		NetworkMode: mode, WGPublicKey: pub, WGPort: port, NetworkReady: ready, NetworkError: nerr,
-		TLS: a.tls && hasCert,
+		TLS: a.tls && hasCert, Firewall: a.firewallStatus(),
 	}
+}
+
+func (a *Agent) firewallStatus() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fwErr != "" {
+		return "error: " + a.fwErr
+	}
+	return a.routing
 }
 
 func portOf(listen string) string {
@@ -296,6 +323,11 @@ func portOf(listen string) string {
 
 func (a *Agent) sync(ctx context.Context) error {
 	req := api.SyncRequest{Node: a.nodeReport(), Pods: a.reports(), Volumes: a.volumeReports(), CSR: a.csr()}
+	a.mu.Lock()
+	for k, snap := range a.restored {
+		req.Restored = append(req.Restored, k+"="+snap)
+	}
+	a.mu.Unlock()
 	body, _ := json.Marshal(req)
 	var lastErr error
 	for i := 0; i < len(a.cfg.Servers); i++ {
@@ -343,7 +375,18 @@ func (a *Agent) applySync(ctx context.Context, resp *api.SyncResponse) {
 	desired := map[string]api.AssignedPod{}
 	for _, ap := range resp.Pods {
 		desired[ap.Pod.Metadata.UID] = ap
+		// Forget restore reports the server has acknowledged.
+		for name, v := range ap.Volumes {
+			_ = name
+			key := v.Metadata.Namespace + "/" + v.Metadata.Name
+			a.mu.Lock()
+			if snap, ok := a.restored[key]; ok && v.Status.Restored == snap {
+				delete(a.restored, key)
+			}
+			a.mu.Unlock()
+		}
 	}
+	a.runSnapshots(resp.Snapshots)
 	a.mu.Lock()
 	a.desired, a.domain = desired, resp.Network.Domain
 	first := !a.synced
@@ -358,7 +401,8 @@ func (a *Agent) applySync(ctx context.Context, resp *api.SyncResponse) {
 		if err := a.dns.Listen(gw); err != nil {
 			log.Printf("dns: %v", err)
 		}
-		a.updateServiceRouting(gw, resp)
+		targets := a.updateServiceRouting(gw, resp)
+		a.updateFirewall(gw, resp, targets)
 	}
 	select {
 	case a.kick <- struct{}{}:
@@ -370,7 +414,7 @@ func (a *Agent) applySync(ctx context.Context, resp *api.SyncResponse) {
 // A service name resolves to the bridge gateway, where this agent proxies the
 // service port to ready pods — the equivalent of a Kubernetes ClusterIP.
 // Headless services resolve straight to the pod IPs instead.
-func (a *Agent) updateServiceRouting(gw string, resp *api.SyncResponse) {
+func (a *Agent) updateServiceRouting(gw string, resp *api.SyncResponse) []proxy.Target {
 	domain := resp.Network.Domain
 	gwIP := net.ParseIP(gw)
 	recs := map[string][]net.IP{}
@@ -420,7 +464,92 @@ func (a *Agent) updateServiceRouting(gw string, resp *api.SyncResponse) {
 		}
 	}
 	a.dns.SetRecords(domain, recs)
-	a.svc.Sync(targets)
+	return targets
+}
+
+// updateFirewall programs services with iptables DNAT (pod IPs preserved, like
+// kube-proxy) when pod IPs are routable, and applies network policies.
+// Without an overlay, services fall back to the userspace proxy.
+func (a *Agent) updateFirewall(gw string, resp *api.SyncResponse, proxyTargets []proxy.Target) {
+	var errs []string
+	routing := "proxy"
+	if a.net.OverlayReady() {
+		if err := a.fw.syncServices(gw, resp.Services); err != nil {
+			errs = append(errs, err.Error())
+			a.fw.reset()
+		} else {
+			routing = "iptables"
+		}
+		if err := a.fw.syncPolicies(resp.Firewall); err != nil {
+			errs = append(errs, err.Error())
+			a.fw.reset()
+		}
+	} else if len(resp.Firewall) > 0 {
+		errs = append(errs, "network policies need --network wireguard or host-gw")
+	}
+	if routing == "iptables" {
+		a.svc.Sync(nil) // DNAT handles services; no userspace listeners
+	} else {
+		a.svc.Sync(proxyTargets)
+	}
+	a.mu.Lock()
+	if strings.Join(errs, "; ") != a.fwErr && len(errs) > 0 {
+		log.Printf("firewall: %s", strings.Join(errs, "; "))
+	}
+	a.routing, a.fwErr = routing, strings.Join(errs, "; ")
+	a.mu.Unlock()
+}
+
+// apiEnv tells pods how to reach the control plane (for operators and other
+// in-cluster API clients): a loopback server address becomes the bridge
+// gateway, which is this host as seen from a pod.
+func (a *Agent) apiEnv() map[string]string {
+	a.mu.Lock()
+	server := a.cfg.Servers[a.server]
+	a.mu.Unlock()
+	gw := a.net.Gateway()
+	for _, lo := range []string{"127.0.0.1", "localhost", "[::1]"} {
+		if gw != "" && strings.Contains(server, "://"+lo) {
+			server = strings.Replace(server, "://"+lo, "://"+gw, 1)
+		}
+	}
+	env := map[string]string{"NUBE_API_SERVER": server}
+	if a.cfg.CAHash != "" {
+		env["NUBE_CA_HASH"] = a.cfg.CAHash
+	}
+	return env
+}
+
+// releaseNFSImages unmounts ReadWriteOnce NFS volumes no pod here uses any
+// more, so another node can mount them.
+func (a *Agent) releaseNFSImages() {
+	a.mu.Lock()
+	used := map[string]bool{}
+	for _, ap := range a.desired {
+		if ap.Pod.Status.Phase == api.PodTerminating {
+			continue
+		}
+		for _, v := range ap.Volumes {
+			used[v.Metadata.Namespace+"/"+v.Metadata.Name] = true
+		}
+	}
+	var release []string
+	for key, img := range a.nfsImages {
+		if !used[key] {
+			release = append(release, key+"|"+img)
+		}
+	}
+	a.mu.Unlock()
+	for _, r := range release {
+		key, img, _ := strings.Cut(r, "|")
+		if err := a.sized.Unmount(img); err == nil {
+			a.mu.Lock()
+			delete(a.nfsImages, key)
+			delete(a.volumes, key)
+			a.mu.Unlock()
+			log.Printf("volume %s released (ReadWriteOnce NFS)", key)
+		}
+	}
 }
 
 // ---------------------------------------------------------------- reports
@@ -481,6 +610,7 @@ func (a *Agent) reconcileLoop(ctx context.Context) {
 			if err := a.reconcile(ctx); err != nil {
 				log.Printf("agent: reconcile: %v", err)
 			}
+			a.releaseNFSImages()
 		}
 	}
 }

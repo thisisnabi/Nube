@@ -31,6 +31,7 @@ var valueFlags = map[string]string{
 	"f": "filename", "filename": "filename", "n": "namespace", "namespace": "namespace", "o": "output", "output": "output",
 	"server": "server", "token": "token", "replicas": "replicas", "tail": "tail", "to-revision": "to-revision",
 	"c": "container", "container": "container", "role": "role", "ca-hash": "ca-hash",
+	"to": "to", "name": "name",
 }
 var boolFlags = map[string]string{
 	"A": "all-namespaces", "all-namespaces": "all-namespaces", "w": "watch", "watch": "watch", "force": "force",
@@ -103,7 +104,8 @@ Client:
   nube delete -f FILE                 delete resources in a manifest
   nube delete KIND NAME [--force]
   nube get KIND [NAME] [-n NS|-A] [-o wide|json|yaml] [-w]
-        kinds: nodes deploy sts jobs cronjobs pods svc ing cm secrets volumes tokens
+        kinds: nodes deploy sts ds jobs cronjobs pods svc ing netpol cm secrets volumes
+               snapshots crd tokens, and the plural of any custom resource
   nube describe KIND NAME
   nube logs POD [-c CONTAINER] [-f] [--tail N]
   nube scale deploy|sts NAME --replicas N
@@ -115,6 +117,9 @@ Client:
   nube cordon|uncordon|drain NODE
   nube label node NAME key=value key-
   nube events [-n NS] [-w]
+  nube snapshot VOLUME [--name NAME]   take a snapshot (stored on the control plane)
+  nube snapshot download NAME FILE     save a snapshot archive (.tar.gz)
+  nube volume move VOLUME --to NODE    move a local volume to another node
   nube token create NAME --role admin|edit|view|node [-n NS ...]
   nube token list | nube token delete NAME
   nube whoami
@@ -196,6 +201,10 @@ func Run(argv []string) int {
 		err = cmdToken(c, a, rest)
 	case "cluster":
 		err = cmdCluster(c, rest)
+	case "snapshot", "snapshots":
+		err = cmdSnapshot(c, a, rest)
+	case "volume", "volumes":
+		err = cmdVolume(c, a, rest)
 	case "dashboard":
 		fmt.Printf("Dashboard: %s/\n", c.cfg.Server)
 		if c.cfg.CAHash != "" {
@@ -343,16 +352,30 @@ func kindArg(rest []string) (string, []string, error) {
 	}
 	kind := api.NormalizeKind(kindStr)
 	if kind == "" {
-		return "", nil, fmt.Errorf("unknown resource type %q", kindStr)
+		// A custom resource: the server resolves its plural/kind/short name.
+		if !api.ValidName(strings.ToLower(kindStr)) {
+			return "", nil, fmt.Errorf("unknown resource type %q", kindStr)
+		}
+		return "custom:" + strings.ToLower(kindStr), rest, nil
 	}
 	return kind, rest, nil
+}
+
+func plural(kind string) string {
+	if p, ok := strings.CutPrefix(kind, "custom:"); ok {
+		return p
+	}
+	return api.Plural(kind)
 }
 
 func objectPath(kind, ns, name string) string {
 	if kind == api.KindNode {
 		return "/api/v1/nodes/" + url.PathEscape(name)
 	}
-	return "/api/v1/namespaces/" + url.PathEscape(ns) + "/" + api.Plural(kind) + "/" + url.PathEscape(name)
+	if kind == api.KindCRD {
+		ns = "-"
+	}
+	return "/api/v1/namespaces/" + url.PathEscape(ns) + "/" + plural(kind) + "/" + url.PathEscape(name)
 }
 
 func cmdDelete(c *client, a args, rest []string) error {
@@ -414,13 +437,16 @@ func getOnce(c *client, a args, kind string, rest []string) error {
 			return err
 		}
 		if a.flags["output"] == "" || a.flags["output"] == "wide" {
+			if strings.HasPrefix(kind, "custom:") {
+				return printCustom(c, kind, []json.RawMessage{obj}, ns == "")
+			}
 			return printTable(kind, []json.RawMessage{obj}, a.flags["output"] == "wide", ns == "")
 		}
 		return printRaw(obj, a.flags["output"])
 	}
-	path := "/api/v1/" + api.Plural(kind)
-	if kind != api.KindNode && ns != "" {
-		path = "/api/v1/namespaces/" + url.PathEscape(ns) + "/" + api.Plural(kind)
+	path := "/api/v1/" + plural(kind)
+	if kind != api.KindNode && kind != api.KindCRD && ns != "" {
+		path = "/api/v1/namespaces/" + url.PathEscape(ns) + "/" + plural(kind)
 	}
 	var list struct {
 		Items []json.RawMessage `json:"items"`
@@ -438,8 +464,11 @@ func getOnce(c *client, a args, kind string, rest []string) error {
 		if ns == "" || kind == api.KindNode {
 			where = "cluster"
 		}
-		fmt.Printf("No %s found in %s.\n", api.Plural(kind), where)
+		fmt.Printf("No %s found in %s.\n", plural(kind), where)
 		return nil
+	}
+	if strings.HasPrefix(kind, "custom:") {
+		return printCustom(c, kind, list.Items, ns == "")
 	}
 	return printTable(kind, list.Items, a.flags["output"] == "wide", ns == "")
 }
@@ -698,6 +727,46 @@ func printTable(kind string, items []json.RawMessage, wide, showNS bool) error {
 			}
 			sort.Strings(keys)
 			fmt.Fprintf(w, "%s%s\t%s\t%s\n", nsCol(cm.Metadata.Namespace), cm.Metadata.Name, strings.Join(keys, ","), age(cm.Metadata.CreatedAt))
+		}
+	case api.KindDaemonSet:
+		fmt.Fprintln(w, nsHead+"NAME\tDESIRED\tCURRENT\tREADY\tUP-TO-DATE\tSTATUS\tIMAGE\tAGE")
+		for _, raw := range items {
+			var d api.DaemonSet
+			json.Unmarshal(raw, &d)
+			fmt.Fprintf(w, "%s%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n", nsCol(d.Metadata.Namespace), d.Metadata.Name, d.Status.DesiredNumber,
+				d.Status.Current, d.Status.Ready, d.Status.Updated, d.Status.Phase, d.Spec.Template.MainImage(), age(d.Metadata.CreatedAt))
+		}
+	case api.KindNetworkPolicy:
+		fmt.Fprintln(w, nsHead+"NAME\tPOD-SELECTOR\tTYPES\tPODS\tAGE")
+		for _, raw := range items {
+			var np api.NetworkPolicy
+			json.Unmarshal(raw, &np)
+			sel := labelString(np.Spec.PodSelector.MatchLabels)
+			if sel == "" {
+				sel = "<all pods>"
+			}
+			fmt.Fprintf(w, "%s%s\t%s\t%s\t%d\t%s\n", nsCol(np.Metadata.Namespace), np.Metadata.Name, sel,
+				strings.Join(np.Spec.PolicyTypes, ","), np.Status.SelectedPods, age(np.Metadata.CreatedAt))
+		}
+	case api.KindVolumeSnapshot:
+		fmt.Fprintln(w, nsHead+"NAME\tVOLUME\tSTATUS\tSIZE\tTAKEN\tCOPIES\tMESSAGE")
+		for _, raw := range items {
+			var s api.VolumeSnapshot
+			json.Unmarshal(raw, &s)
+			taken := "-"
+			if !s.Status.TakenAt.IsZero() {
+				taken = age(s.Status.TakenAt) + " ago"
+			}
+			fmt.Fprintf(w, "%s%s\t%s\t%s\t%s\t%s\t%d\t%s\n", nsCol(s.Metadata.Namespace), s.Metadata.Name, s.Spec.Volume,
+				s.Status.Phase, humanSize(s.Status.SizeBytes), taken, len(s.Status.StoredOn), s.Status.Message)
+		}
+	case api.KindCRD:
+		fmt.Fprintln(w, "NAME\tKIND\tPLURAL\tSHORT\tOBJECTS\tAGE")
+		for _, raw := range items {
+			var c api.CustomResourceDefinition
+			json.Unmarshal(raw, &c)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n", c.Metadata.Name, c.Spec.Kind, c.Spec.Plural,
+				firstNonEmpty(strings.Join(c.Spec.ShortNames, ","), "-"), c.Status.Objects, age(c.Metadata.CreatedAt))
 		}
 	case api.KindVolume:
 		fmt.Fprintln(w, nsHead+"NAME\tTYPE\tSIZE\tUSED\tSTATUS\tNODE\tUSED-BY\tAGE")
@@ -1122,4 +1191,148 @@ func cmdCluster(c *client, rest []string) error {
 		return nil
 	}
 	return fmt.Errorf("usage: nube cluster status | nube cluster remove SERVER_ID")
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n <= 0:
+		return "-"
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fGi", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMi", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKi", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%dB", n)
+}
+
+// printCustom prints custom objects using the printer columns of their CRD.
+func printCustom(c *client, kind string, items []json.RawMessage, showNS bool) error {
+	var crds struct {
+		Items []api.CustomResourceDefinition `json:"items"`
+	}
+	c.getJSON("/api/v1/customresourcedefinitions", &crds)
+	name := strings.TrimPrefix(kind, "custom:")
+	var cols []api.PrinterColumn
+	for _, d := range crds.Items {
+		if d.Spec.Plural == name || strings.EqualFold(d.Spec.Kind, name) || contains(d.Spec.ShortNames, name) {
+			cols = d.Spec.PrinterColumns
+		}
+	}
+	w := newTab()
+	defer w.Flush()
+	head := "NAME"
+	if showNS {
+		head = "NAMESPACE\tNAME"
+	}
+	for _, col := range cols {
+		head += "\t" + strings.ToUpper(col.Name)
+	}
+	fmt.Fprintln(w, head+"\tSYNCED\tAGE")
+	for _, raw := range items {
+		var o api.CustomObject
+		json.Unmarshal(raw, &o)
+		var doc map[string]any
+		json.Unmarshal(raw, &doc)
+		line := o.Metadata.Name
+		if showNS {
+			line = o.Metadata.Namespace + "\t" + line
+		}
+		for _, col := range cols {
+			line += "\t" + lookupPath(doc, col.Path)
+		}
+		synced := "no"
+		if o.Observed >= o.Generation {
+			synced = "yes"
+		}
+		fmt.Fprintln(w, line+"\t"+synced+"\t"+age(o.Metadata.CreatedAt))
+	}
+	return nil
+}
+
+func lookupPath(doc map[string]any, path string) string {
+	var cur any = doc
+	for _, part := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return "-"
+		}
+		cur = m[part]
+	}
+	if cur == nil {
+		return "-"
+	}
+	switch v := cur.(type) {
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case string:
+		return v
+	}
+	b, _ := json.Marshal(cur)
+	return string(b)
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func cmdSnapshot(c *client, a args, rest []string) error {
+	if len(rest) >= 1 && rest[0] == "download" {
+		if len(rest) < 3 {
+			return fmt.Errorf("usage: nube snapshot download NAME FILE")
+		}
+		c.rebuild(0)
+		resp, err := c.request("GET", "/api/v1/namespaces/"+url.PathEscape(a.ns())+"/volumesnapshots/"+url.PathEscape(rest[1])+"/data", nil, "")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		f, err := os.Create(rest[2])
+		if err != nil {
+			return err
+		}
+		n, err := io.Copy(f, resp.Body)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Printf("saved %s (%s, sha256 %s)\n", rest[2], humanSize(n), resp.Header.Get("X-Nube-SHA256"))
+		return nil
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: nube snapshot VOLUME [--name NAME] | nube snapshot download NAME FILE")
+	}
+	name := a.flags["name"]
+	if name == "" {
+		name = rest[0] + "-" + time.Now().UTC().Format("20060102-150405")
+	}
+	manifest := fmt.Sprintf("kind: VolumeSnapshot\nmetadata: {name: %s, namespace: %s}\nspec: {volume: %s}\n", name, a.ns(), rest[0])
+	var out struct {
+		Results []string `json:"results"`
+	}
+	if err := c.send("POST", "/api/v1/apply", []byte(manifest), "application/yaml", &out); err != nil {
+		return err
+	}
+	fmt.Printf("volumesnapshot/%s requested; watch it with: nube get snapshots\n", name)
+	return nil
+}
+
+func cmdVolume(c *client, a args, rest []string) error {
+	if len(rest) != 2 || rest[0] != "move" || a.flags["to"] == "" {
+		return fmt.Errorf("usage: nube volume move VOLUME --to NODE")
+	}
+	var out map[string]string
+	if err := c.postJSON("/api/v1/namespaces/"+url.PathEscape(a.ns())+"/volumes/"+url.PathEscape(rest[1])+"/move", map[string]string{"node": a.flags["to"]}, &out); err != nil {
+		return err
+	}
+	fmt.Println(out["status"])
+	return nil
 }

@@ -37,7 +37,7 @@ type Config struct {
 	DataDir      string
 	Token        string // bootstrap admin token
 	ServiceBind  string // address the service load balancer binds to
-	ClusterCIDR  string // pod network, e.g. 10.88.0.0/16
+	ClusterCIDR  string // pod network, e.g. 10.244.0.0/16
 	Domain       string // cluster DNS domain
 	APIAdvertise string // URL reachable by other servers (HA), e.g. https://10.0.0.1:7070
 
@@ -47,6 +47,14 @@ type Config struct {
 
 	IngressHTTP  string // ingress listen address, e.g. :80 ("" = disabled)
 	IngressHTTPS string // e.g. :443
+
+	TLSCertFile string // serve the API with this certificate instead of the cluster CA's
+	TLSKeyFile  string
+
+	ACMEEmail     string // enables ACME (Let's Encrypt) certificates
+	ACMEDirectory string // default: Let's Encrypt production
+	ACMECAFile    string // CA to trust for a private ACME directory
+	ACMEDomain    string // public name of the API/dashboard, served with an ACME certificate
 
 	HA            bool
 	ServerID      string
@@ -61,14 +69,16 @@ type Server struct {
 	store   store.Store
 	lb      *loadBalancer
 	ingress *ingress
+	acme    *acmeManager
 	certs   *certs
+	live    *liveStats
 	started time.Time
 	http    *http.Server
 }
 
 func New(cfg Config) (*Server, error) {
 	if cfg.ClusterCIDR == "" {
-		cfg.ClusterCIDR = "10.88.0.0/16"
+		cfg.ClusterCIDR = "10.244.0.0/16"
 	}
 	if cfg.Domain == "" {
 		cfg.Domain = "nube"
@@ -111,10 +121,16 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, store: st, started: time.Now()}
+	s := &Server{cfg: cfg, store: st, started: time.Now(), live: newLiveStats()}
 	s.lb = newLoadBalancer(s)
 	s.ingress = newIngress(s)
 	s.certs = &certs{s: s}
+	if s.acme, err = newACME(s); err != nil {
+		return nil, err
+	}
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return nil, errors.New("--tls-cert and --tls-key go together")
+	}
 	return s, nil
 }
 
@@ -154,8 +170,12 @@ func (s *Server) Run(ctx context.Context) error {
 	log.Printf("nube server %s listening on %s://%s (mode=%s, data=%s)", version.Version, s.scheme(), s.cfg.Listen, s.store.Cluster().Mode, s.cfg.DataDir)
 
 	go s.controllerLoop(ctx)
+	go s.snapshotLoop(ctx)
 	go s.lb.run(ctx)
 	go s.ingress.run(ctx)
+	if s.acme != nil {
+		go s.acme.run(ctx)
+	}
 	if s.cfg.HA && s.cfg.Join != "" {
 		go s.joinLoop(ctx)
 	}

@@ -54,7 +54,7 @@ func runServer(args []string) int {
 	fs.StringVar(&cfg.DataDir, "data", envOr("NUBE_DATA", "/var/lib/nube"), "data directory")
 	fs.StringVar(&cfg.Token, "token", os.Getenv("NUBE_TOKEN"), "cluster token (generated into <data>/token if empty)")
 	fs.StringVar(&cfg.ServiceBind, "service-bind", envOr("NUBE_SERVICE_BIND", "0.0.0.0"), "address service load-balancer ports bind to")
-	fs.StringVar(&cfg.ClusterCIDR, "cluster-cidr", envOr("NUBE_CLUSTER_CIDR", "10.88.0.0/16"), "pod network (/16, one /24 per node)")
+	fs.StringVar(&cfg.ClusterCIDR, "cluster-cidr", envOr("NUBE_CLUSTER_CIDR", "10.244.0.0/16"), "pod network (/16, one /24 per node)")
 	fs.StringVar(&cfg.Domain, "domain", envOr("NUBE_DOMAIN", "nube"), "cluster DNS domain")
 	fs.BoolVar(&cfg.HA, "ha", os.Getenv("NUBE_HA") == "true", "run as a member of a highly-available (Raft) control plane")
 	fs.StringVar(&cfg.ServerID, "id", os.Getenv("NUBE_SERVER_ID"), "unique server id in HA mode (default: hostname)")
@@ -68,6 +68,12 @@ func runServer(args []string) int {
 	fs.StringVar(&cfg.CAHash, "ca-hash", os.Getenv("NUBE_CA_HASH"), "cluster CA to trust when joining (HA), sha256:...")
 	fs.StringVar(&cfg.IngressHTTP, "ingress-http", envOr("NUBE_INGRESS_HTTP", ":80"), "ingress HTTP address (\"off\" to disable)")
 	fs.StringVar(&cfg.IngressHTTPS, "ingress-https", envOr("NUBE_INGRESS_HTTPS", ":443"), "ingress HTTPS address (\"off\" to disable)")
+	fs.StringVar(&cfg.TLSCertFile, "tls-cert", os.Getenv("NUBE_TLS_CERT"), "serve the API with this certificate file (PEM) instead of one from the cluster CA")
+	fs.StringVar(&cfg.TLSKeyFile, "tls-key", os.Getenv("NUBE_TLS_KEY"), "private key for --tls-cert")
+	fs.StringVar(&cfg.ACMEEmail, "acme-email", os.Getenv("NUBE_ACME_EMAIL"), "enable ACME (Let's Encrypt) certificates; contact e-mail")
+	fs.StringVar(&cfg.ACMEDirectory, "acme-directory", os.Getenv("NUBE_ACME_DIRECTORY"), "ACME directory URL (default: Let's Encrypt)")
+	fs.StringVar(&cfg.ACMECAFile, "acme-ca", os.Getenv("NUBE_ACME_CA"), "CA certificate to trust for a private ACME directory")
+	fs.StringVar(&cfg.ACMEDomain, "acme-domain", os.Getenv("NUBE_ACME_DOMAIN"), "public domain of the API/dashboard: serve it with an ACME certificate")
 	fs.Parse(args)
 	for _, v := range strings.Split(*sans, ",") {
 		if v = strings.TrimSpace(v); v != "" {
@@ -113,6 +119,7 @@ func runAgent(args []string) int {
 	fs.StringVar(&cfg.DockerHost, "docker", os.Getenv("DOCKER_HOST"), "Docker endpoint (default unix:///var/run/docker.sock)")
 	fs.StringVar(&cfg.NetworkMode, "network", envOr("NUBE_NETWORK", "wireguard"), "pod overlay: wireguard | host-gw | none")
 	fs.IntVar(&cfg.WGPort, "wg-port", 51820, "WireGuard UDP port")
+	fs.StringVar(&cfg.Runtime, "runtime", envOr("NUBE_RUNTIME", "docker"), "container runtime: docker | podman")
 	fs.Parse(args)
 
 	for _, s := range strings.Split(*servers, ",") {
@@ -127,6 +134,10 @@ func runAgent(args []string) int {
 		}
 	}
 	cfg.CPU, cfg.Memory = *cpu, *mem
+	if cfg.Runtime != "docker" && cfg.Runtime != "podman" {
+		fmt.Fprintln(os.Stderr, "--runtime must be docker or podman")
+		return 2
+	}
 	switch cfg.NetworkMode {
 	case "wireguard", "host-gw", "none":
 	default:

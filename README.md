@@ -3,7 +3,7 @@
 **A small, real Kubernetes-like container orchestrator, written from scratch in Go.**
 
 One binary (`nube`) is the control plane, the node agent and the CLI, with a web dashboard built in.
-It runs your containers on Docker across one or many Linux machines, keeps them healthy, networks them
+It runs your containers on Docker or Podman across one or many Linux machines, keeps them healthy, networks them
 together, and survives the loss of a node or a control-plane server.
 
 [فارسی](README.fa.md)
@@ -15,8 +15,8 @@ together, and survives the loss of a node or a control-plane server.
                 └───────────────▲───────────────────────────────▲─────────────────────┘
                   sync (HTTPS + node token)         sync (HTTPS + node token)
                 ┌───────────────┴────────┐   ┌──────────────────┴─────┐
-                │ node agent  (Docker)   │   │ node agent  (Docker)   │
-                │ pods 10.88.1.0/24      │◄─►│ pods 10.88.2.0/24      │
+                │ node agent  (Docker)   │   │ node agent  (Podman)   │
+                │ pods 10.244.1.0/24     │◄─►│ pods 10.244.2.0/24     │
                 │ DNS + service proxy    │ WireGuard   DNS + proxy    │
                 └────────────────────────┘   └────────────────────────┘
 ```
@@ -29,21 +29,25 @@ together, and survives the loss of a node or a control-plane server.
 | Area | What you get |
 |---|---|
 | **Pods** | Multiple containers sharing `localhost` (a pause container owns the network, like Kubernetes), init containers that run in order, shared `emptyDir` scratch volumes on disk or in memory with size limits |
-| **Workloads** | `Deployment` with rolling updates, rollback, pause/resume and CPU autoscaling · `StatefulSet` with stable names (`db-0`, `db-1`), ordered start-up, a volume per replica and per-pod DNS · `Job` with completions, parallelism, backoff limit and deadline · `CronJob` with cron schedules, time zones and concurrency policy |
+| **Workloads** | `Deployment` with rolling updates, rollback, pause/resume and CPU autoscaling · `StatefulSet` with stable names (`db-0`, `db-1`), ordered start-up, a volume per replica and per-pod DNS · `DaemonSet` with one pod per (selected) node and rolling updates · `Job` with completions, parallelism, backoff limit and deadline · `CronJob` with cron schedules, time zones and concurrency policy |
 | **Scheduler** | Filters on readiness, cordoning, `nodeSelector`, CPU/memory requests, host ports and volume location; spreads replicas across nodes |
 | **Self-healing** | Per-container restart with exponential back-off (CrashLoopBackOff), HTTP and TCP health checks, rescheduling when a node is lost |
 | **Networking** | A pod subnet per node, an encrypted **WireGuard** overlay (or host-gw), direct pod-to-pod traffic |
-| **Services** | **TCP and UDP**, a node-local proxy on every node (like a ClusterIP), `headless` and `internal` services, a load balancer on every control-plane server |
-| **Ingress** | HTTP/HTTPS routing by host (including `*.example.com`) and path on ports 80/443, TLS from a `tls` Secret or a self-signed fallback, HTTP→HTTPS redirect |
+| **Services** | **TCP and UDP**, kernel-level routing with iptables DNAT on every node (source IP preserved; a userspace proxy where the overlay is off), `headless` and `internal` services, a load balancer on every control-plane server |
+| **Network policies** | `NetworkPolicy` with ingress and egress rules by pod labels, namespaces, IP blocks and ports, enforced with iptables on every node |
+| **Ingress** | HTTP/HTTPS routing by host (including `*.example.com`) and path on ports 80/443, **automatic Let's Encrypt certificates** (`acme: true`, shared by all servers), TLS from a `tls` Secret or a self-signed fallback, HTTP→HTTPS redirect |
 | **DNS** | `web`, `web.prod`, `web.default.svc.nube`, `db-0.db`, `POD.default.pod.nube` |
-| **Storage** | `local` volumes with an **enforced size** (each is its own ext4 filesystem — writes past the size fail), `nfs` and `hostPath`; live usage per volume |
-| **Security** | **HTTPS API** with a cluster CA that clients pin by hash, **mutual TLS** between servers and agents, **role-based tokens** (`admin`, `edit`, `view`, `node`) optionally scoped to namespaces, masked secret values |
-| **High availability** | 3 or 5 servers replicated with **Raft**; a new leader is elected within seconds and agents fail over automatically |
+| **Storage** | `local` volumes with an **enforced size** (each is its own ext4 filesystem — writes past the size fail), `nfs` (shared, or `ReadWriteOnce` with an enforced size that follows the pod to any node) and `hostPath`; live usage per volume |
+| **Snapshots and backups** | `VolumeSnapshot`s stored on (and replicated across) the control plane, scheduled backups with retention, new volumes restored from a snapshot, `nube volume move` to another node, automatic recovery onto a healthy node when a volume's node is lost |
+| **Extensibility** | `CustomResourceDefinition`s with schema validation and defaults, custom objects with status, watch and garbage collection, a Go client (`pkg/client`) and an example operator |
+| **Security** | **HTTPS API** with a cluster CA that clients pin by hash (or a Let's Encrypt or your own certificate for the dashboard), **mutual TLS** between servers and agents, **role-based tokens** (`admin`, `edit`, `view`, `node`) optionally scoped to namespaces, masked secret values |
+| **High availability** | 3 or 5 servers replicated with **Raft**, which ships only what changed in each write; a new leader is elected within seconds and agents fail over automatically |
+| **Runtimes** | Docker or Podman (through its Docker-compatible API), chosen per node |
 | **Observability** | Live dashboard, events, streaming logs per container, CPU/memory/disk usage, `nube top` |
 
 ### What has actually been tested
 
-On a Docker test cluster (3 HA servers with TLS + 2 Docker-in-Docker nodes with WireGuard) and on a fresh Ubuntu 24.04 install:
+On a Docker test cluster (3 HA servers with TLS + Docker-in-Docker and Podman nodes with WireGuard) and on a fresh Ubuntu 24.04 install:
 
 - an init container wrote a page, nginx served it and a sidecar reached it over `localhost`;
 - `db-1` only started once `db-0` was ready, each replica got its own volume, `db-0.db` resolved to the right pod, and a rolling restart went from the highest ordinal down;
@@ -53,7 +57,14 @@ On a Docker test cluster (3 HA servers with TLS + 2 Docker-in-Docker nodes with 
 - Ingress routed by host and path and served the certificate from a Secret;
 - a `view` token could not change anything, an `edit` token scoped to `dev` could not see `default`, a revoked token stopped working immediately, and a wrong CA hash was rejected;
 - killing the Raft leader elected a new one and writes were forwarded to it over HTTPS;
-- a bad image never took down the running replicas, and rollback restored them.
+- a bad image never took down the running replicas, and rollback restored them;
+- a DaemonSet ran exactly one pod per node; services kept the caller's source IP and balanced across nodes;
+- a NetworkPolicy blocked and allowed traffic on both nodes, and removing it opened the pods again;
+- the example operator created, scaled and garbage-collected the objects of a custom `Website` kind, and the schema rejected invalid objects;
+- snapshots were replicated to all three servers and downloaded; a volume moved to another node, and another recovered after its node was lost, with their data;
+- an NFS `ReadWriteOnce` volume enforced its size and followed its pod to another node;
+- with a test ACME CA (Pebble), every server served the issued certificates for the API and Ingress hosts, and after the leader was stopped the new leader issued a certificate for a new host;
+- on a Podman node, multi-container pods, DNS, services, sized volumes and snapshots worked.
 
 ---
 
@@ -105,6 +116,7 @@ Run the command the installer printed on the other machine:
 ```bash
 sudo bash install.sh agent --server https://SERVER_IP:7070 --token nube_xxx --ca-hash sha256:...
 ```
+Add `--runtime podman` to run the node's pods on Podman instead of Docker.
 A node token can only register a node and sync its pods; the admin token never leaves the servers.
 
 ### 4. Highly-available control plane (3 servers)
@@ -117,6 +129,16 @@ sudo bash install.sh server --ha --id s2 --join https://S1_IP:7070 --token ADMIN
 sudo bash install.sh server --ha --id s3 --join https://S1_IP:7070 --token ADMIN_TOKEN --ca-hash sha256:...
 ```
 Use `single` instead of `server` if the servers should run pods too. Three servers tolerate the loss of one; five tolerate two.
+
+### 5. Let's Encrypt
+
+```bash
+sudo bash install.sh server ... --acme-email you@example.com [--acme-domain nube.example.com]
+```
+Ingress hosts with `acme: true` then get certificates automatically: DNS must point at the servers and port 80 or 443
+must be reachable from the internet. `--acme-domain` also serves the dashboard and API with a real certificate.
+Only the Raft leader talks to Let's Encrypt; certificates and challenge answers are replicated, so any server can answer.
+To use your own certificate for the API instead, run the server with `--tls-cert` and `--tls-key`.
 
 ### Ports
 
@@ -138,13 +160,17 @@ Uninstall with `sudo bash install.sh uninstall` (data and running containers are
 ```bash
 nube login --server https://SERVER:7070 --token TOKEN    # shows the CA fingerprint and asks before trusting it
 nube apply -f app.yaml                                   # file, directory or - for stdin
-nube get nodes|deploy|sts|jobs|cronjobs|pods|svc|ing|cm|secrets|volumes [-n NS | -A] [-o wide|json|yaml] [-w]
+nube get nodes|deploy|sts|ds|jobs|cronjobs|pods|svc|ing|netpol|cm|secrets|volumes|snapshots|crd [-n NS | -A] [-o wide|json|yaml] [-w]
+nube get websites                                        # any custom kind, by plural or short name
 nube describe pod NAME
 nube logs POD [-c CONTAINER] [-f] [--tail N]
 nube scale deploy|sts NAME --replicas 5
 nube set image deploy NAME nginx:1.27 [-c CONTAINER]
 nube rollout status|history|undo|restart|pause|resume deploy|sts NAME
 nube trigger cronjob NAME                                # run now
+nube snapshot VOLUME [--name NAME]                       # take a snapshot
+nube snapshot download NAME FILE                         # save it as a tar file
+nube volume move VOLUME --to NODE                        # move a local volume (and its pod) to another node
 nube suspend|resume cronjob NAME
 nube token create ci --role edit -n prod                 # the secret is shown once
 nube token list | nube token delete ci
@@ -170,7 +196,7 @@ nube cluster status
 ## Manifest reference (short)
 
 ```yaml
-kind: Deployment              # or StatefulSet / Job / Pod
+kind: Deployment              # or StatefulSet / DaemonSet / Job / Pod
 metadata: { name: app, namespace: default }
 spec:
   replicas: 3
@@ -206,8 +232,32 @@ spec:
 ---
 kind: Volume
 metadata: { name: data }
-spec: { type: local, size: 10Gi }   # size is enforced
+spec:
+  type: local
+  size: 10Gi                                  # enforced
+  backup: { schedule: "0 3 * * *", keep: 7 }  # nightly snapshots
+  autoRecover: true                           # restore on another node if this one is lost
+  # restoreFrom: data-snap                    # start from a VolumeSnapshot
+---
+kind: NetworkPolicy
+metadata: { name: db-access }
+spec:
+  podSelector: { matchLabels: { app: db } }
+  ingress:
+    - from: [{ podSelector: { matchLabels: { role: api } } }]
+      ports: [{ port: 5432 }]
+---
+kind: Ingress
+metadata: { name: web }
+spec:
+  tls: [{ hosts: [app.example.com], acme: true }]
+  rules:
+    - host: app.example.com
+      paths: [{ path: /, backend: { service: app, port: 8080 } }]
 ```
+
+With `containers:`, put `image`, `command`, `ports`, `volumes` and so on inside each container. The same fields at the
+template level are the single-container shorthand, and mixing the two is rejected.
 
 Complete examples in [`examples/`](examples):
 
@@ -223,6 +273,7 @@ Complete examples in [`examples/`](examples):
 | `ingress.yaml` | Host and path routing with TLS |
 | `udp.yaml` | UDP service |
 | `nfs-volume.yaml` | NFS volume |
+| `operator/` | A `Website` CRD and an operator (Go, using `pkg/client`) that turns websites into deployments, services and ingresses |
 
 ---
 
@@ -240,22 +291,29 @@ Complete examples in [`examples/`](examples):
 - **Security.** The first leader creates a CA, stored in the replicated state. Each server issues itself a certificate from
   it; agents send a CSR and get a certificate for their own IP; servers call agents with a client certificate.
   See `internal/pki` and `internal/server/auth.go`.
-- **High availability.** Every state change is a Raft log entry holding a full snapshot of the state, which keeps the state
-  machine simple and deterministic. Only the leader runs controllers; followers forward writes to it.
-  See `internal/store/raft.go`.
-- **Networking.** Each node owns a Docker bridge network (`nube0`) with its own /24. WireGuard (`nube-wg`) routes pod
-  subnets between nodes without NAT; traffic to the internet is masqueraded. DNS and the service proxy listen on the
-  bridge gateway (`10.88.N.1`).
+- **High availability.** Every write is a Raft log entry holding only the objects it changed (a patch), so the log stays
+  small however big the cluster is. Heartbeats and usage metrics stay in memory on the leader. Only the leader runs
+  controllers; followers forward writes to it. See `internal/store/raft.go` and `patch.go`.
+- **Networking.** Each node owns a bridge network (`nube0`) with its own /24 of `10.244.0.0/16`. WireGuard (`nube-wg`)
+  routes pod subnets between nodes without NAT; traffic to the internet is masqueraded. Services are iptables DNAT rules
+  (`NUBE-SERVICES`); network policies are per-pod iptables chains. DNS listens on the bridge gateway (`10.244.N.1`).
+- **Snapshots.** An agent tars a volume and uploads it to the servers, which replicate it among themselves; a restore
+  streams it back into a fresh volume on the target node. Moves and recoveries are a snapshot plus a restore.
+- **Custom resources.** A CRD adds a kind to the API, with a JSON-schema subset for validation and defaults. Operators use
+  `watch` (long polling on resource versions) and write `status`; objects labelled `nube/owned-by=Kind/name` are deleted
+  with their owner. See `internal/server/crd.go` and `examples/operator`.
 - **Upgrades without downtime.** Pods keep running when the agent restarts (`KillMode=process`); the agent adopts them again.
 
 ## Limitations
 
-- No DaemonSets, NetworkPolicies, CRDs or operators.
-- Ingress does not obtain Let's Encrypt certificates automatically — put one (e.g. from certbot) in a `tls` Secret.
-- `local` volumes are tied to their node; `nfs` volume sizes are managed by the NFS server; no snapshots or backups.
-- Docker is the only container runtime.
-- In HA mode the whole state is replicated with every change: fine for tens of nodes and hundreds of pods, not thousands.
-- Certificates come from the cluster's own CA. To expose the dashboard on the internet, put it behind an Ingress with a real certificate.
+- Kubernetes manifests and `kubectl` are not supported; Nube has its own, simpler manifest format and CLI.
+- A `local` volume lives on one node. Moving or recovering it restores the latest snapshot, so writes made after that
+  snapshot are lost if the node dies. Use `nfs` with `ReadWriteOnce` for data that must survive a node without a restore.
+- Snapshots are stored on the control-plane servers, so the servers' disks limit their total size.
+- Shared `nfs` volumes (`ReadWriteMany`) have no enforced size; that is up to the NFS server.
+- Every server holds the whole state in memory: good for tens of nodes and a few thousand pods.
+- Only the Docker and Podman runtimes are supported (no containerd/CRI).
+- Pods get no isolation beyond what Docker or Podman provide (no user namespaces, custom seccomp profiles or sandbox runtimes).
 
 ## Development
 
@@ -272,10 +330,11 @@ cmd/nube/            main: server | agent | pause | CLI
 internal/api/        resource types, manifest parsing, quantities
 internal/store/      state, file store, Raft store
 internal/server/     API, auth, scheduler, controllers, load balancer, ingress, dashboard (web/)
-internal/agent/      Docker client, pods, networking, DNS, volumes
+internal/agent/      Docker/Podman client, pods, networking, firewall, DNS, volumes, snapshots
 internal/proxy/      TCP/UDP load balancer
 internal/pki/        cluster CA and pinned TLS
 internal/cli/        kubectl-style client
+pkg/client/          Go client for operators
 deploy/              installer and systemd units
 test/e2e/            Docker-based multi-node test cluster
 ```
@@ -291,3 +350,5 @@ test/e2e/            Docker-based multi-node test cluster
 | Pod stuck in `Pending` or `Init` | `nube describe pod NAME` and `nube logs POD -c INIT_CONTAINER` |
 | `403 ... needs role edit` | Your token's role is not enough (`nube whoami`) |
 | `ErrImagePull` | Check the image name and that Docker on the node can reach the registry |
+| Ingress shows an `acme:` error | DNS must point at the servers and port 80 or 443 must be reachable from the internet |
+| `nube apply` says to put fields inside each container | You used `containers:` and also top-level fields like `volumes:`; move them into the container |

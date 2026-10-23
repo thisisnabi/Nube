@@ -37,7 +37,7 @@ func apply(t *testing.T, st *store.State, yaml string) {
 // becomes ready, every terminating pod disappears.
 func tick(st *store.State) {
 	now := time.Now()
-	reconcileNodes(st, now)
+	reconcileNodes(st, now, nil)
 	for _, k := range sortedKeys(st.Deployments) {
 		reconcileDeployment(st, st.Deployments[k], now)
 	}
@@ -230,7 +230,7 @@ spec:
 		p.Status.CPU = 200 // 100% of request
 	}
 	d := st.Deployments["default/api"]
-	autoscale(st, d, time.Now())
+	autoscale(st, d, time.Now(), nil)
 	if d.Spec.Replicas != 4 {
 		t.Fatalf("want 4 replicas at 2x target load, got %d", d.Spec.Replicas)
 	}

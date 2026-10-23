@@ -2,6 +2,7 @@
 
 Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور کانتینر کوچک ولی واقعی است که با Go نوشته شده.
 یک باینری (`nube`) هم control plane است، هم agent نودها و هم CLI. یک داشبورد وب هم داخلش embed شده.
+کانتینرها روی Docker یا Podman اجرا می‌شوند.
 
 [English](README.md)
 
@@ -12,8 +13,8 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
                  └──────────────▲──────────────────────────────▲──────────────────┘
                    sync (HTTPS + node token)        sync (HTTPS + node token)
                  ┌──────────────┴─────────┐   ┌────────────────┴───────┐
-                 │ node agent  (Docker)   │   │ node agent  (Docker)   │
-                 │ pods 10.88.1.0/24      │◄─►│ pods 10.88.2.0/24      │
+                 │ node agent  (Docker)   │   │ node agent  (Podman)   │
+                 │ pods 10.244.1.0/24     │◄─►│ pods 10.244.2.0/24     │
                  │ DNS + service proxy    │ WireGuard   DNS + proxy    │
                  └────────────────────────┘   └────────────────────────┘
 ```
@@ -23,20 +24,24 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
 | حوزه | چه چیزی پیاده شده |
 |---|---|
 | **Pod** | چند کانتینر در هر pod که `localhost` مشترک دارند (مثل Kubernetes، با یک کانتینر pause که صاحب شبکه است)، init container که به ترتیب اجرا می‌شود، و `emptyDir` مشترک (روی دیسک یا حافظه، با محدودیت حجم) |
-| **Workloads** | `Deployment` با rolling update، rollback و autoscale. `StatefulSet` با نام‌های پایدار (`db-0`، `db-1`)، شروع مرتب، یک volume برای هر replica و DNS برای هر pod. `Job` با completions، parallelism، backoffLimit و deadline. `CronJob` با زمان‌بندی cron و time zone و concurrencyPolicy |
+| **Workloads** | `Deployment` با rolling update، rollback و autoscale. `StatefulSet` با نام‌های پایدار (`db-0`، `db-1`)، شروع مرتب، یک volume برای هر replica و DNS برای هر pod. `DaemonSet` با یک pod روی هر نود (یا نودهای انتخاب‌شده) و rolling update. `Job` با completions، parallelism، backoffLimit و deadline. `CronJob` با زمان‌بندی cron و time zone و concurrencyPolicy |
 | **Scheduler** | فیلتر بر اساس Ready/cordon، `nodeSelector`، CPU/RAM درخواستی، host port و محل volume. پخش replicaها روی نودهای مختلف |
 | **Self-healing** | restart با backoff نمایی برای هر کانتینر، health check از نوع HTTP و TCP، جابه‌جایی podها وقتی نودی از دست می‌رود |
 | **Networking** | subnet جداگانه برای هر نود، overlay رمزنگاری‌شده با **WireGuard** (یا host-gw)، ارتباط مستقیم pod به pod |
-| **Services** | **TCP و UDP**، پراکسی روی هر نود (شبیه ClusterIP)، سرویس‌های `headless` (DNS مستقیم به IP podها) و `internal` (فقط داخل کلاستر)، load balancer روی سرورها |
-| **Ingress** | مسیریابی HTTP/HTTPS بر اساس hostname (شامل `*.example.com`) و path روی پورت‌های 80/443، با TLS از یک Secret نوع `tls` یا گواهی self-signed، و redirect از HTTP به HTTPS |
+| **Services** | **TCP و UDP**، مسیریابی در سطح کرنل با iptables DNAT روی هر نود (IP مبدأ حفظ می‌شود؛ وقتی overlay خاموش است پراکسی userspace)، سرویس‌های `headless` (DNS مستقیم به IP podها) و `internal` (فقط داخل کلاستر)، load balancer روی سرورها |
+| **NetworkPolicy** | قوانین ingress و egress بر اساس label podها، namespace، بازه‌ی IP و پورت، که با iptables روی هر نود اعمال می‌شوند |
+| **Ingress** | مسیریابی HTTP/HTTPS بر اساس hostname (شامل `*.example.com`) و path روی پورت‌های 80/443، **گواهی خودکار Let's Encrypt** (`acme: true`، مشترک بین همه‌ی سرورها)، یا TLS از یک Secret نوع `tls` یا گواهی self-signed، و redirect از HTTP به HTTPS |
 | **DNS** | `web`، `web.prod`، `web.default.svc.nube`، `db-0.db` و `POD.default.pod.nube` |
-| **Storage** | `Volume` از نوع `local` با **حجم اجباری** (هر volume یک فایل‌سیستم ext4 مستقل است و بیشتر از اندازه‌اش نمی‌شود نوشت)، `nfs` و `hostPath`. گزارش مصرف واقعی هر volume |
-| **امنیت** | **API روی HTTPS** با CA اختصاصی کلاستر (کلاینت‌ها hash آن را pin می‌کنند)، **mutual TLS** بین سرور و agentها، **توکن‌های چندگانه با نقش** (`admin`، `edit`، `view`، `node`) و محدودسازی به namespace، و ماسک‌شدن مقدار secretها |
-| **High availability** | ۳ (یا ۵) سرور با **Raft**. در صورت از کار افتادن leader، ظرف چند ثانیه leader جدید انتخاب می‌شود. agentها خودکار به سرور سالم سوییچ می‌کنند |
+| **Storage** | `Volume` از نوع `local` با **حجم اجباری** (هر volume یک فایل‌سیستم ext4 مستقل است و بیشتر از اندازه‌اش نمی‌شود نوشت)، `nfs` (اشتراکی، یا `ReadWriteOnce` با حجم اجباری که همراه pod به هر نودی می‌رود) و `hostPath`. گزارش مصرف واقعی هر volume |
+| **Snapshot و backup** | `VolumeSnapshot` که روی سرورهای control plane ذخیره و بین آن‌ها تکثیر می‌شود، backup زمان‌بندی‌شده با نگه‌داشتن تعداد مشخص، ساخت volume جدید از snapshot، جابه‌جایی volume به نود دیگر با `nube volume move`، و بازیابی خودکار روی نود سالم وقتی نود volume از دست برود |
+| **توسعه‌پذیری** | `CustomResourceDefinition` با اعتبارسنجی schema و مقدار پیش‌فرض، شیءهای سفارشی با status، watch و garbage collection، کلاینت Go ‏(`pkg/client`) و یک operator نمونه |
+| **امنیت** | **API روی HTTPS** با CA اختصاصی کلاستر (کلاینت‌ها hash آن را pin می‌کنند) یا گواهی Let's Encrypt یا گواهی خودتان برای داشبورد، **mutual TLS** بین سرور و agentها، **توکن‌های چندگانه با نقش** (`admin`، `edit`، `view`، `node`) و محدودسازی به namespace، و ماسک‌شدن مقدار secretها |
+| **High availability** | ۳ (یا ۵) سرور با **Raft** که در هر تغییر فقط همان بخش تغییرکرده را تکثیر می‌کند. در صورت از کار افتادن leader، ظرف چند ثانیه leader جدید انتخاب می‌شود. agentها خودکار به سرور سالم سوییچ می‌کنند |
+| **Runtime** | Docker یا Podman (از طریق API سازگار با Docker)، برای هر نود جداگانه |
 | **Observability** | داشبورد زنده، رویدادها، لاگ زنده‌ی هر کانتینر (`logs -c`)، مصرف CPU، RAM و دیسک |
 
 ### چه چیزهایی واقعاً تست شده
-روی یک کلاستر Docker با ۳ سرور HA (با TLS) و ۲ نود (Docker-in-Docker با WireGuard)، و یک نصب تمیز روی Ubuntu 24.04:
+روی یک کلاستر Docker با ۳ سرور HA (با TLS) و نودهای Docker-in-Docker و Podman (با WireGuard)، و یک نصب تمیز روی Ubuntu 24.04:
 
 - **Pod چندکانتینری:** init container صفحه را نوشت، nginx سرو کرد، و sidecar از طریق `localhost` به آن رسید.
 - **StatefulSet:** `db-1` فقط بعد از Ready شدن `db-0` بالا آمد. هر replica volume خودش را داشت. `db-0.db` به pod درست resolve شد. rolling restart از بالاترین ordinal انجام شد.
@@ -46,6 +51,13 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
 - **Ingress:** مسیریابی با host و path، و HTTPS با گواهی همان Secret.
 - **امنیت:** توکن view نتوانست تغییری بدهد، توکن edit محدود به `dev` نتوانست `default` را ببیند، توکن revoke‌شده فوراً از کار افتاد، و CA اشتباه رد شد.
 - **HA:** با kill کردن leader، leader جدید انتخاب شد و درخواست‌ها روی HTTPS به آن فرستاده شد.
+- **DaemonSet و Service:** دقیقاً یک pod روی هر نود اجرا شد. سرویس‌ها IP مبدأ را حفظ کردند و بار را بین نودها پخش کردند.
+- **NetworkPolicy:** ترافیک روی هر دو نود مسدود و مجاز شد و با حذف policy دوباره باز شد.
+- **CRD و operator:** operator نمونه شیءهای نوع `Website` را ساخت، scale کرد و بعد از حذف پاک کرد. schema شیءهای نامعتبر را رد کرد.
+- **Snapshot:** snapshotها روی هر ۳ سرور تکثیر و دانلود شدند. یک volume به نود دیگر منتقل شد و یکی دیگر بعد از از دست رفتن نودش بازیابی شد، با داده‌هایشان.
+- **NFS:** volume از نوع `ReadWriteOnce` حجمش را رعایت کرد و همراه pod به نود دیگر رفت.
+- **Let's Encrypt:** با یک CA تستی ACME ‏(Pebble)، همه‌ی سرورها گواهی صادرشده را برای API و Ingress سرو کردند. بعد از توقف leader، leader جدید برای یک host تازه گواهی گرفت.
+- **Podman:** روی یک نود Podman، pod چندکانتینری، DNS، سرویس‌ها، volume با حجم اجباری و snapshot کار کردند.
 
 ---
 
@@ -83,6 +95,7 @@ curl http://SERVER_IP:8080
 ```bash
 sudo bash install.sh agent --server https://SERVER_IP:7070 --token nube_xxx --ca-hash sha256:...
 ```
+برای اجرای podهای این نود روی Podman به‌جای Docker، گزینه‌ی `--runtime podman` را اضافه کنید.
 توکن نود فقط اجازه‌ی ثبت نود و همگام‌سازی podها را دارد. توکن admin هیچ‌وقت روی نودها نمی‌رود.
 
 ### ۴) control plane با HA ‏(۳ سرور)
@@ -94,6 +107,15 @@ sudo bash install.sh server --ha --id s2 --join https://S1_IP:7070 --token ADMIN
 sudo bash install.sh server --ha --id s3 --join https://S1_IP:7070 --token ADMIN_TOKEN --ca-hash sha256:...
 ```
 اگر می‌خواهید سرورها خودشان هم pod اجرا کنند، به‌جای `server` از `single` استفاده کنید. کلاستر ۳تایی از دست رفتن یک سرور را تحمل می‌کند.
+
+### ۵) Let's Encrypt
+```bash
+sudo bash install.sh server ... --acme-email you@example.com [--acme-domain nube.example.com]
+```
+از این به بعد hostهای Ingress که `acme: true` دارند خودکار گواهی می‌گیرند. DNS باید به سرورها اشاره کند و پورت 80 یا 443
+از اینترنت در دسترس باشد. با `--acme-domain` داشبورد و API هم گواهی معتبر می‌گیرند.
+فقط leader با Let's Encrypt صحبت می‌کند. گواهی‌ها و پاسخ challengeها تکثیر می‌شوند، پس هر سروری می‌تواند جواب بدهد.
+برای استفاده از گواهی خودتان روی API، سرور را با `--tls-cert` و `--tls-key` اجرا کنید.
 
 ### پورت‌ها
 | پورت | کاربرد |
@@ -114,13 +136,17 @@ sudo bash install.sh server --ha --id s3 --join https://S1_IP:7070 --token ADMIN
 ```bash
 nube login --server https://SERVER:7070 --token TOKEN      # fingerprint مربوط به CA را نشان می‌دهد و می‌پرسد
 nube apply -f app.yaml
-nube get nodes|deploy|sts|jobs|cronjobs|pods|svc|ing|cm|secrets|volumes [-n NS | -A] [-o wide|yaml] [-w]
+nube get nodes|deploy|sts|ds|jobs|cronjobs|pods|svc|ing|netpol|cm|secrets|volumes|snapshots|crd [-n NS | -A] [-o wide|yaml] [-w]
+nube get websites                  # هر نوع سفارشی، با نام جمع یا نام کوتاه
 nube describe pod NAME
 nube logs POD [-c CONTAINER] [-f]
 nube scale deploy|sts NAME --replicas 5
 nube set image deploy NAME nginx:1.27 [-c CONTAINER]
 nube rollout status|history|undo|restart deploy|sts NAME
 nube trigger cronjob NAME          # اجرای فوری
+nube snapshot VOLUME [--name NAME] # گرفتن snapshot
+nube snapshot download NAME FILE   # ذخیره به‌صورت فایل tar
+nube volume move VOLUME --to NODE  # انتقال volume از نوع local (و pod آن) به نود دیگر
 nube suspend|resume cronjob NAME
 nube token create ci --role edit -n prod       # فقط یک بار نشان داده می‌شود
 nube token list | nube token delete ci
@@ -143,7 +169,7 @@ nube cluster status
 ## مرجع manifest (خلاصه)
 
 ```yaml
-kind: Deployment            # یا StatefulSet / Job / Pod
+kind: Deployment            # یا StatefulSet / DaemonSet / Job / Pod
 metadata: { name: app, namespace: default }
 spec:
   replicas: 3
@@ -177,8 +203,32 @@ spec:
 ---
 kind: Volume
 metadata: { name: data }
-spec: { type: local, size: 10Gi }    # حجم اجباری
+spec:
+  type: local
+  size: 10Gi                                  # حجم اجباری
+  backup: { schedule: "0 3 * * *", keep: 7 }  # snapshot شبانه
+  autoRecover: true                           # اگر نود از دست برود، روی نود دیگر بازیابی شود
+  # restoreFrom: data-snap                    # شروع از یک VolumeSnapshot
+---
+kind: NetworkPolicy
+metadata: { name: db-access }
+spec:
+  podSelector: { matchLabels: { app: db } }
+  ingress:
+    - from: [{ podSelector: { matchLabels: { role: api } } }]
+      ports: [{ port: 5432 }]
+---
+kind: Ingress
+metadata: { name: web }
+spec:
+  tls: [{ hosts: [app.example.com], acme: true }]
+  rules:
+    - host: app.example.com
+      paths: [{ path: /, backend: { service: app, port: 8080 } }]
 ```
+
+وقتی از `containers:` استفاده می‌کنید، `image`، `command`، `ports`، `volumes` و بقیه را داخل هر کانتینر بنویسید. همین فیلدها
+در سطح template مخصوص حالت تک‌کانتینری هستند و ترکیب این دو رد می‌شود.
 
 نمونه‌های کامل در `examples/`:
 
@@ -194,6 +244,7 @@ spec: { type: local, size: 10Gi }    # حجم اجباری
 | `ingress.yaml` | Ingress با host و path |
 | `udp.yaml` | سرویس UDP |
 | `nfs-volume.yaml` | volume از نوع NFS |
+| `operator/` | یک CRD به نام `Website` و یک operator (با Go و `pkg/client`) که از آن Deployment، Service و Ingress می‌سازد |
 
 ---
 
@@ -209,16 +260,26 @@ spec: { type: local, size: 10Gi }    # حجم اجباری
 - **امنیت:** اولین leader یک CA می‌سازد که داخل state تکثیرشده نگه داشته می‌شود. هر سرور با آن برای خودش گواهی صادر می‌کند.
   agentها CSR می‌فرستند و گواهی‌شان را با IP خودشان می‌گیرند. سرور با client certificate به agentها وصل می‌شود.
   کد: `internal/pki` و `internal/server/auth.go`.
-- **HA:** هر تغییر state یک entry در لاگ Raft است. فقط leader کنترلرها را اجرا می‌کند. کد: `internal/store/raft.go`.
+- **HA:** هر تغییر state یک entry در لاگ Raft است که فقط شیءهای تغییرکرده را دارد (patch). heartbeat و آمار مصرف فقط در حافظه‌ی
+  leader می‌مانند. فقط leader کنترلرها را اجرا می‌کند. کد: `internal/store/raft.go` و `patch.go`.
+- **شبکه:** هر نود یک شبکه‌ی bridge ‏(`nube0`) با یک /24 از `10.244.0.0/16` دارد. WireGuard ‏(`nube-wg`) subnetها را بدون NAT بین
+  نودها مسیریابی می‌کند. سرویس‌ها قوانین iptables DNAT هستند و NetworkPolicyها زنجیره‌های iptables برای هر pod. DNS روی
+  gateway شبکه (`10.244.N.1`) گوش می‌دهد.
+- **Snapshot:** agent از volume یک tar می‌سازد و روی سرورها آپلود می‌کند و سرورها آن را بین خودشان تکثیر می‌کنند. بازیابی آن را در
+  یک volume تازه روی نود مقصد باز می‌کند. انتقال و بازیابی خودکار هم همان snapshot و restore است.
+- **CRD:** یک CRD نوع جدیدی به API اضافه می‌کند، با زیرمجموعه‌ای از JSON schema برای اعتبارسنجی و مقدار پیش‌فرض. operatorها از
+  `watch` استفاده می‌کنند و `status` را می‌نویسند. شیءهایی که label ‏`nube/owned-by=Kind/name` دارند همراه صاحبشان حذف می‌شوند.
 
 ## محدودیت‌هایی که هنوز هست
 
-- **DaemonSet**، **NetworkPolicy**، CRD و operator وجود ندارد.
-- Ingress گواهی Let's Encrypt را خودکار نمی‌گیرد. گواهی را (مثلاً با certbot) در یک Secret نوع `tls` بگذارید.
-- volume از نوع `local` به نودش وابسته است. حجم volumeهای `nfs` را سرور NFS مدیریت می‌کند. snapshot و backup خودکار ندارد.
-- runtime فقط Docker است.
-- در HA کل state در هر entry تکثیر می‌شود. این برای ده‌ها نود و صدها pod کافی است، نه برای هزاران.
-- گواهی‌ها self-signed هستند (CA خود کلاستر). برای دسترسی از اینترنت، داشبورد را پشت Ingress با گواهی معتبر بگذارید.
+- manifestهای Kubernetes و `kubectl` پشتیبانی نمی‌شوند. Nube فرمت manifest و CLI ساده‌تر خودش را دارد.
+- volume از نوع `local` روی یک نود است. انتقال یا بازیابی آن آخرین snapshot را برمی‌گرداند، پس اگر نود از کار بیفتد نوشته‌های بعد از
+  آن snapshot از دست می‌روند. برای داده‌ای که باید بدون restore از خرابی نود جان سالم به در ببرد از `nfs` با `ReadWriteOnce` استفاده کنید.
+- snapshotها روی سرورهای control plane ذخیره می‌شوند، پس دیسک سرورها حجم کل آن‌ها را محدود می‌کند.
+- volumeهای اشتراکی `nfs` ‏(`ReadWriteMany`) حجم اجباری ندارند و این با سرور NFS است.
+- هر سرور کل state را در حافظه نگه می‌دارد. این برای ده‌ها نود و چند هزار pod مناسب است.
+- فقط Docker و Podman پشتیبانی می‌شوند (containerd/CRI نه).
+- ایزوله‌سازی podها بیشتر از آنچه Docker یا Podman می‌دهند نیست (user namespace، پروفایل seccomp سفارشی یا runtime ایزوله ندارد).
 
 ## توسعه و تست
 
@@ -238,3 +299,5 @@ bash test/e2e/up.sh    # کلاستر تستی روی Docker: ۳ سرور HA ب�
 | در وضعیت volume پیام `size not enforced` هست | `e2fsprogs` روی نود نیست، یا volume قبل از تعیین size ساخته شده |
 | pod در `Pending` یا `Init` مانده | `nube describe pod NAME` و `nube logs POD -c INIT_CONTAINER` |
 | `403 ... needs role edit` | توکن شما نقش کافی ندارد (`nube whoami`) |
+| Ingress خطای `acme:` نشان می‌دهد | DNS باید به سرورها اشاره کند و پورت 80 یا 443 از اینترنت در دسترس باشد |
+| `nube apply` می‌گوید فیلدها را داخل هر کانتینر بگذارید | هم `containers:` دارید و هم فیلدهایی مثل `volumes:` در سطح بالا؛ آن‌ها را داخل کانتینر ببرید |

@@ -1,0 +1,20 @@
+# NFS ReadWriteOnce: size enforced (ext4 image on the share), pods can move
+# to any node and keep their data.
+kind: Volume
+metadata: { name: shared-db }
+spec:
+  type: nfs
+  accessMode: ReadWriteOnce
+  size: 64Mi
+  nfs: { server: 172.30.0.50, path: /, options: "nfsvers=4,soft,timeo=30" }
+---
+kind: Deployment
+metadata: { name: nfsdb }
+spec:
+  replicas: 1
+  strategy: { maxSurge: 0, maxUnavailable: 1 }
+  template:
+    image: redis:7-alpine
+    args: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    volumes: [{ volume: shared-db, containerPath: /data }]
+    healthCheck: { tcpSocket: { port: 6379 } }

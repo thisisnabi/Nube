@@ -60,23 +60,45 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/nodes/{name}/{action}", s.handleNodeAction)
 
 	mux.HandleFunc("GET /api/v1/{kind}", func(w http.ResponseWriter, r *http.Request) {
-		s.handleList(w, r, api.NormalizeKind(r.PathValue("kind")), "")
+		s.handleList(w, r, s.resolveKind(r.PathValue("kind")), "")
 	})
 	mux.HandleFunc("GET /api/v1/namespaces/{ns}/{kind}", func(w http.ResponseWriter, r *http.Request) {
-		s.handleList(w, r, api.NormalizeKind(r.PathValue("kind")), r.PathValue("ns"))
+		s.handleList(w, r, s.resolveKind(r.PathValue("kind")), r.PathValue("ns"))
 	})
 	mux.HandleFunc("GET /api/v1/namespaces/{ns}/{kind}/{name}", func(w http.ResponseWriter, r *http.Request) {
-		s.handleGet(w, r, api.NormalizeKind(r.PathValue("kind")), r.PathValue("ns"), r.PathValue("name"))
+		s.handleGet(w, r, s.resolveKind(r.PathValue("kind")), r.PathValue("ns"), r.PathValue("name"))
 	})
 	mux.HandleFunc("DELETE /api/v1/namespaces/{ns}/{kind}/{name}", func(w http.ResponseWriter, r *http.Request) {
-		s.handleDelete(w, r, api.NormalizeKind(r.PathValue("kind")), r.PathValue("ns"), r.PathValue("name"))
+		s.handleDelete(w, r, s.resolveKind(r.PathValue("kind")), r.PathValue("ns"), r.PathValue("name"))
 	})
+	mux.HandleFunc("PUT /api/v1/namespaces/{ns}/{kind}/{name}/status", s.handleCustomStatus)
+	mux.HandleFunc("GET /api/v1/watch/{kind}", s.handleWatch)
+	mux.HandleFunc("POST /api/v1/namespaces/{ns}/volumes/{name}/move", s.handleVolumeMove)
+	mux.HandleFunc("GET /api/v1/namespaces/{ns}/volumesnapshots/{name}/data", s.handleSnapshotDownload)
+	mux.HandleFunc("POST /api/v1/agent/snapshots/{ns}/{name}", s.handleSnapshotUpload)
+	mux.HandleFunc("GET /api/v1/agent/snapshots/{ns}/{name}", s.handleSnapshotDownload)
+	mux.HandleFunc("POST /api/v1/cluster/snapshots/stored", s.handleSnapshotStored)
+	mux.HandleFunc("POST /api/v1/cluster/acme", s.handleACMECache)
 	mux.HandleFunc("POST /api/v1/namespaces/{ns}/deployments/{name}/{action}", s.handleDeploymentAction)
 	mux.HandleFunc("POST /api/v1/namespaces/{ns}/statefulsets/{name}/{action}", s.handleStatefulSetAction)
 	mux.HandleFunc("POST /api/v1/namespaces/{ns}/cronjobs/{name}/{action}", s.handleCronJobAction)
 	mux.HandleFunc("GET /api/v1/namespaces/{ns}/pods/{name}/logs", s.handleLogs)
 
 	mux.HandleFunc("POST /api/v1/agent/sync", s.handleSync)
+}
+
+// resolveKind maps a URL segment to a built-in kind or a custom resource kind.
+func (s *Server) resolveKind(raw string) string {
+	if k := api.NormalizeKind(raw); k != "" {
+		return k
+	}
+	kind := ""
+	s.store.Read(func(st *store.State) {
+		if c := st.CRDByName(raw); c != nil {
+			kind = c.Spec.Kind
+		}
+	})
+	return kind
 }
 
 func (s *Server) clusterInfo() api.ClusterInfo {
@@ -121,19 +143,30 @@ func visible[T any](id *api.Identity, list []T, ns func(T) string) []T {
 }
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	// Usage metrics live in the leader's memory: ask it.
+	if !s.store.IsLeader() && s.store.LeaderAPI() != "" && r.Header.Get("X-Nube-Forwarded") == "" {
+		s.forwardToLeader(w, r)
+		return
+	}
 	id := identityFrom(r)
 	ov := api.Overview{Version: version.Version, StartedAt: s.started, Cluster: s.clusterInfo(), Me: *id}
 	s.readJSON(w, func(st *store.State) (int, any) {
-		ov.Nodes = sortedValues(st.Nodes, func(n *api.Node) string { return n.Name })
+		for _, n := range sortedValues(st.Nodes, func(n *api.Node) string { return n.Name }) {
+			ov.Nodes = append(ov.Nodes, s.live.node(n))
+		}
 		ov.Deployments = visible(id, sortedValues(st.Deployments, func(d *api.Deployment) string { return d.Metadata.Key() }), func(d *api.Deployment) string { return d.Metadata.Namespace })
 		ov.StatefulSets = visible(id, sortedValues(st.StatefulSets, func(d *api.StatefulSet) string { return d.Metadata.Key() }), func(d *api.StatefulSet) string { return d.Metadata.Namespace })
 		ov.Jobs = visible(id, sortedValues(st.Jobs, func(d *api.Job) string { return d.Metadata.Key() }), func(d *api.Job) string { return d.Metadata.Namespace })
 		ov.CronJobs = visible(id, sortedValues(st.CronJobs, func(d *api.CronJob) string { return d.Metadata.Key() }), func(d *api.CronJob) string { return d.Metadata.Namespace })
-		ov.Pods = visible(id, sortedValues(st.Pods, func(p *api.Pod) string { return p.Metadata.Key() }), func(d *api.Pod) string { return d.Metadata.Namespace })
+		for _, p := range visible(id, sortedValues(st.Pods, func(p *api.Pod) string { return p.Metadata.Key() }), func(d *api.Pod) string { return d.Metadata.Namespace }) {
+			ov.Pods = append(ov.Pods, s.live.pod(p))
+		}
 		ov.Services = s.lb.decorate(visible(id, sortedValues(st.Services, func(v *api.Service) string { return v.Metadata.Key() }), func(d *api.Service) string { return d.Metadata.Namespace }))
 		ov.Ingresses = s.ingress.decorate(visible(id, sortedValues(st.Ingresses, func(v *api.Ingress) string { return v.Metadata.Key() }), func(d *api.Ingress) string { return d.Metadata.Namespace }))
 		ov.ConfigMaps = visible(id, sortedValues(st.ConfigMaps, func(v *api.ConfigMap) string { return v.Metadata.Key() }), func(d *api.ConfigMap) string { return d.Metadata.Namespace })
-		ov.Volumes = visible(id, sortedValues(st.Volumes, func(v *api.Volume) string { return v.Metadata.Key() }), func(d *api.Volume) string { return d.Metadata.Namespace })
+		for _, v := range visible(id, sortedValues(st.Volumes, func(v *api.Volume) string { return v.Metadata.Key() }), func(d *api.Volume) string { return d.Metadata.Namespace }) {
+			ov.Volumes = append(ov.Volumes, s.live.volume(v))
+		}
 		ov.Secrets = []*api.Secret{}
 		for _, sec := range visible(id, sortedValues(st.Secrets, func(v *api.Secret) string { return v.Metadata.Key() }), func(d *api.Secret) string { return d.Metadata.Namespace }) {
 			ov.Secrets = append(ov.Secrets, maskSecret(sec))
@@ -142,6 +175,16 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		for _, e := range st.Events[max(0, len(st.Events)-300):] {
 			if e.Namespace == "" || nsAllowed(id, e.Namespace) {
 				ov.Events = append(ov.Events, e)
+			}
+		}
+		ov.DaemonSets = visible(id, sortedValues(st.DaemonSets, func(v *api.DaemonSet) string { return v.Metadata.Key() }), func(d *api.DaemonSet) string { return d.Metadata.Namespace })
+		ov.Policies = visible(id, sortedValues(st.Policies, func(v *api.NetworkPolicy) string { return v.Metadata.Key() }), func(d *api.NetworkPolicy) string { return d.Metadata.Namespace })
+		ov.Snapshots = visible(id, sortedValues(st.Snapshots, func(v *api.VolumeSnapshot) string { return v.Metadata.Key() }), func(d *api.VolumeSnapshot) string { return d.Metadata.Namespace })
+		ov.CRDs = sortedValues(st.CRDs, func(v *api.CustomResourceDefinition) string { return v.Spec.Kind })
+		ov.Custom = []*api.CustomObject{}
+		for _, k := range sortedKeys(st.Custom) {
+			if o := st.Custom[k]; !strings.HasPrefix(k, "~") && nsAllowed(id, o.Metadata.Namespace) {
+				ov.Custom = append(ov.Custom, o)
 			}
 		}
 		ov.Namespaces = visible(id, st.Namespaces(), func(n string) string { return n })
@@ -212,12 +255,38 @@ func namespaced(st *store.State, kind string) map[string]any {
 		for k, v := range st.Volumes {
 			add(k, v)
 		}
+	case api.KindDaemonSet:
+		for k, v := range st.DaemonSets {
+			add(k, v)
+		}
+	case api.KindNetworkPolicy:
+		for k, v := range st.Policies {
+			add(k, v)
+		}
+	case api.KindVolumeSnapshot:
+		for k, v := range st.Snapshots {
+			add(k, v)
+		}
+	case api.KindCRD:
+		for _, v := range st.CRDs {
+			add("/"+v.Metadata.Name, v) // cluster-scoped
+		}
+	default:
+		if st.CRDs[kind] != nil {
+			return customList(st, kind)
+		}
 	}
 	return out
 }
 
 func (s *Server) present(kind string, v any, reveal bool) any {
 	switch o := v.(type) {
+	case *api.Node:
+		return s.live.node(o)
+	case *api.Pod:
+		return s.live.pod(o)
+	case *api.Volume:
+		return s.live.volume(o)
 	case *api.Secret:
 		if !reveal {
 			return maskSecret(o)
@@ -241,7 +310,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind, ns str
 		out := []any{}
 		if kind == api.KindNode {
 			for _, v := range sortedValues(st.Nodes, func(n *api.Node) string { return n.Name }) {
-				out = append(out, v)
+				out = append(out, s.live.node(v))
 			}
 			return 200, map[string]any{"kind": kind, "items": out}
 		}
@@ -263,7 +332,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, kind, ns, nam
 		var v any
 		if kind == api.KindNode {
 			if n := st.Nodes[name]; n != nil {
-				v = n
+				v = s.live.node(n)
+			}
+		} else if kind == api.KindCRD {
+			if o, ok := namespaced(st, kind)["/"+name]; ok {
+				v = o
 			}
 		} else if o, ok := namespaced(st, kind)[ns+"/"+name]; ok {
 			v = s.present(kind, o, reveal)
@@ -321,6 +394,10 @@ func (s *Server) parseRequestManifests(w http.ResponseWriter, r *http.Request) (
 	for _, o := range objs {
 		if !nsAllowed(id, o.Namespace) {
 			writeErr(w, http.StatusForbidden, fmt.Sprintf("%s may not change namespace %s", id.Name, o.Namespace))
+			return nil, false
+		}
+		if o.Kind == api.KindCRD && id.Role != api.RoleAdmin {
+			writeErr(w, http.StatusForbidden, "custom resource definitions are cluster-wide: only admins may change them")
 			return nil, false
 		}
 		if o.Kind == api.KindNode || o.Kind == api.KindToken {
@@ -407,6 +484,10 @@ func asNotFound(err error, nf *notFound) bool {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, kind, ns, name string) {
 	if kind == "" || kind == api.KindToken {
 		writeErr(w, 404, "unknown resource type")
+		return
+	}
+	if kind == api.KindCRD && identityFrom(r).Role != api.RoleAdmin {
+		writeErr(w, http.StatusForbidden, "custom resource definitions are cluster-wide: only admins may delete them")
 		return
 	}
 	force := r.URL.Query().Get("force") == "1"

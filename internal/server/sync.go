@@ -15,8 +15,14 @@ import (
 	"github.com/thisisnabi/Nube/internal/store"
 )
 
+// heartbeatPersistEvery is how often an unchanged node's heartbeat is still
+// written to the replicated state (so a new leader knows roughly when nodes were seen).
+const heartbeatPersistEvery = time.Minute
+
 // handleSync is the agent heartbeat: the agent reports its node and pods and
 // gets back the pods it should run plus network/service routing information.
+// Usage numbers and heartbeats stay in memory; the replicated state is only
+// written when something meaningful changed.
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	var req api.SyncRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -28,53 +34,63 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := req.Node.Name
-	err := s.store.Write(func(st *store.State) error {
-		now := time.Now()
-		n := st.Nodes[name]
-		if n == nil {
-			n = &api.Node{Name: name, JoinedAt: now, Labels: map[string]string{}}
-			st.Nodes[name] = n
-			st.Event("Normal", api.KindNode, "", name, "NodeJoined", fmt.Sprintf("node joined from %s (%d cores, %d MiB)", req.Node.HostIP, req.Node.Capacity.CPU/1000, req.Node.Capacity.Memory))
-		}
-		if n.Status != api.NodeReady {
-			if !n.LastHeartbeat.IsZero() {
-				st.Event("Normal", api.KindNode, "", name, "NodeReady", "node is reporting again")
+	now := time.Now()
+	s.live.record(&req, now)
+
+	needed := false
+	s.store.Read(func(st *store.State) { needed = syncNeedsWrite(st, &req, now) })
+	if needed {
+		err := s.store.Write(func(st *store.State) error {
+			n := st.Nodes[name]
+			if n == nil {
+				n = &api.Node{Name: name, JoinedAt: now, Labels: map[string]string{}}
+				st.Nodes[name] = n
+				st.Event("Normal", api.KindNode, "", name, "NodeJoined", fmt.Sprintf("node joined from %s (%d cores, %d MiB)", req.Node.HostIP, req.Node.Capacity.CPU/1000, req.Node.Capacity.Memory))
 			}
-			n.Status = api.NodeReady
-		}
-		if n.Labels == nil {
-			n.Labels = map[string]string{}
-		}
-		for k, v := range req.Node.Labels {
-			n.Labels[k] = v
-		}
-		n.Labels["nube/hostname"] = name
-		n.Address, n.HostIP = req.Node.Address, req.Node.HostIP
-		n.Capacity, n.Usage, n.Info = req.Node.Capacity, req.Node.Usage, req.Node.Info
-		n.NetworkMode, n.WGPublicKey, n.WGPort = req.Node.NetworkMode, req.Node.WGPublicKey, req.Node.WGPort
-		n.NetworkReady, n.NetworkError, n.TLS = req.Node.NetworkReady, req.Node.NetworkError, req.Node.TLS
-		n.LastHeartbeat = now
-		if n.PodCIDR == "" {
-			cidr, err := allocatePodCIDR(st, s.cfg.ClusterCIDR)
-			if err != nil {
-				return err
+			if n.Status != api.NodeReady {
+				if !n.LastHeartbeat.IsZero() {
+					st.Event("Normal", api.KindNode, "", name, "NodeReady", "node is reporting again")
+				}
+				n.Status = api.NodeReady
 			}
-			n.PodCIDR = cidr
-			st.Event("Normal", api.KindNode, "", name, "PodCIDR", "allocated pod subnet "+cidr)
-		}
-		for _, rep := range req.Pods {
-			applyReport(st, n, rep, now)
-		}
-		for _, vr := range req.Volumes {
-			if v := st.Volumes[vr.Namespace+"/"+vr.Name]; v != nil && (v.Status.NodeName == name || v.Spec.Type != "local") {
-				v.Status.UsedMiB, v.Status.CapacityMiB, v.Status.Enforced, v.Status.Message = vr.UsedMiB, vr.CapacityMiB, vr.Enforced, vr.Message
+			if n.Labels == nil {
+				n.Labels = map[string]string{}
 			}
+			for k, v := range req.Node.Labels {
+				n.Labels[k] = v
+			}
+			n.Labels["nube/hostname"] = name
+			copyNodeFields(n, &req.Node)
+			n.LastHeartbeat = now
+			if n.PodCIDR == "" {
+				cidr, err := allocatePodCIDR(st, s.cfg.ClusterCIDR)
+				if err != nil {
+					return err
+				}
+				n.PodCIDR = cidr
+				st.Event("Normal", api.KindNode, "", name, "PodCIDR", "allocated pod subnet "+cidr)
+			}
+			for _, rep := range req.Pods {
+				applyReport(st, n, rep, now)
+			}
+			for _, vr := range req.Volumes {
+				if v := st.Volumes[vr.Namespace+"/"+vr.Name]; v != nil && (v.Status.NodeName == name || v.Spec.Type != "local") {
+					v.Status.CapacityMiB, v.Status.Enforced, v.Status.Message = vr.CapacityMiB, vr.Enforced, vr.Message
+				}
+			}
+			for _, rv := range req.Restored {
+				key, snap, _ := strings.Cut(rv, "=")
+				if v := st.Volumes[key]; v != nil && v.Status.RestoreFrom == snap && v.Status.Restored != snap {
+					v.Status.Restored = snap
+					st.Event("Normal", api.KindVolume, v.Metadata.Namespace, v.Metadata.Name, "Restored", "restored from snapshot "+snap+" on "+name)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			writeStoreErr(w, err)
+			return
 		}
-		return nil
-	})
-	if err != nil {
-		writeStoreErr(w, err)
-		return
 	}
 	var resp api.SyncResponse
 	s.store.Read(func(st *store.State) { resp = s.buildSyncResponse(st, name) })
@@ -93,6 +109,63 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		resp.CA = caCert
 	}
 	writeJSON(w, 200, resp)
+}
+
+func copyNodeFields(n *api.Node, r *api.Node) {
+	n.Address, n.HostIP = r.Address, r.HostIP
+	n.Capacity, n.Info = r.Capacity, r.Info
+	n.NetworkMode, n.WGPublicKey, n.WGPort = r.NetworkMode, r.WGPublicKey, r.WGPort
+	n.NetworkReady, n.NetworkError, n.TLS, n.Firewall = r.NetworkReady, r.NetworkError, r.TLS, r.Firewall
+}
+
+// syncNeedsWrite reports whether a sync carries anything worth replicating.
+// It only looks at this node and its pods, so it is cheap.
+func syncNeedsWrite(st *store.State, req *api.SyncRequest, now time.Time) bool {
+	n := st.Nodes[req.Node.Name]
+	if n == nil || n.Status != api.NodeReady || n.PodCIDR == "" || now.Sub(n.LastHeartbeat) > heartbeatPersistEvery {
+		return true
+	}
+	probe := *n
+	copyNodeFields(&probe, &req.Node)
+	if !jsonEqual(&probe, n) {
+		return true
+	}
+	for k, v := range req.Node.Labels {
+		if n.Labels[k] != v {
+			return true
+		}
+	}
+	if len(req.Restored) > 0 {
+		return true
+	}
+	for _, rep := range req.Pods {
+		p := st.Pods[rep.Namespace+"/"+rep.Name]
+		if p == nil || p.Metadata.UID != rep.UID || p.Spec.NodeName != n.Name {
+			continue
+		}
+		if p.Status.Phase == api.PodTerminating {
+			if rep.Phase == api.PodTerminated {
+				return true
+			}
+			continue
+		}
+		ps := p.Status
+		if ps.Phase != rep.Phase || ps.Ready != rep.Ready || ps.Message != rep.Message || ps.ContainerID != rep.ContainerID ||
+			ps.Restarts != rep.Restarts || ps.ExitCode != rep.ExitCode || (rep.PodIP != "" && ps.PodIP != rep.PodIP) ||
+			!ps.StartedAt.Equal(rep.StartedAt) || !ps.FinishedAt.Equal(rep.FinishedAt) ||
+			!jsonEqual(ps.HostPorts, rep.HostPorts) || !jsonEqual(ps.HostPortsUDP, rep.HostPortsUDP) ||
+			!jsonEqual(ps.Containers, rep.Containers) {
+			return true
+		}
+	}
+	for _, vr := range req.Volumes {
+		if v := st.Volumes[vr.Namespace+"/"+vr.Name]; v != nil && (v.Status.NodeName == n.Name || v.Spec.Type != "local") {
+			if v.Status.CapacityMiB != vr.CapacityMiB || v.Status.Enforced != vr.Enforced || v.Status.Message != vr.Message {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // allocatePodCIDR hands out the lowest free /24 inside the cluster /16.
@@ -123,7 +196,6 @@ func applyReport(st *store.State, n *api.Node, rep api.PodReport, now time.Time)
 			st.Event("Normal", api.KindPod, p.Metadata.Namespace, p.Metadata.Name, "Deleted", "pod stopped and removed")
 			return
 		}
-		p.Status.CPU, p.Status.Memory = rep.CPU, rep.Memory
 		return
 	}
 	ps := &p.Status
@@ -131,7 +203,7 @@ func applyReport(st *store.State, n *api.Node, rep api.PodReport, now time.Time)
 	ps.Phase, ps.Ready, ps.Message = rep.Phase, rep.Ready, rep.Message
 	ps.ContainerID, ps.Containers = rep.ContainerID, rep.Containers
 	ps.HostPorts, ps.HostPortsUDP, ps.Restarts, ps.ExitCode = rep.HostPorts, rep.HostPortsUDP, rep.Restarts, rep.ExitCode
-	ps.CPU, ps.Memory, ps.StartedAt, ps.FinishedAt = rep.CPU, rep.Memory, rep.StartedAt, rep.FinishedAt
+	ps.StartedAt, ps.FinishedAt = rep.StartedAt, rep.FinishedAt
 	ps.HostIP = n.HostIP
 	if rep.PodIP != "" {
 		ps.PodIP = rep.PodIP
@@ -214,6 +286,13 @@ func (s *Server) buildSyncResponse(st *store.State, nodeName string) api.SyncRes
 			})
 		}
 		resp.Services = append(resp.Services, route)
+	}
+	resp.Firewall = firewallFor(st, nodeName)
+	resp.Snapshots = snapshotTasks(st, nodeName)
+	for _, id := range sortedKeys(st.Servers) {
+		if addr := st.Servers[id].APIAddr; addr != "" {
+			resp.APIServers = append(resp.APIServers, addr)
+		}
 	}
 	for _, p := range st.Pods {
 		if p.Status.PodIP == "" || p.Status.Phase == api.PodTerminating || p.Finished() {

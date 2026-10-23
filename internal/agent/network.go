@@ -31,7 +31,7 @@ const (
 
 // network owns everything that makes pod IPs routable across nodes:
 //
-//   - a Docker bridge network with this node's /24 (10.88.N.0/24)
+//   - a Docker bridge network with this node's /24 (10.244.N.0/24)
 //   - routes to every other node's /24, either via WireGuard or directly
 //   - iptables rules: forward pod<->pod traffic, masquerade pod->internet
 type network struct {
@@ -196,10 +196,14 @@ func (n *network) ensureBridge(ctx context.Context, subnet, gateway string) erro
 	if err != nil {
 		return err
 	}
-	if info != nil && info.Subnet == subnet {
+	if info != nil && info.Subnet == subnet && !info.DNS {
 		return nil
 	}
 	if info != nil {
+		if info.Subnet == subnet && info.Count > 0 { // Podman DNS on; recreated once the node is drained
+			log.Printf("network: podman network %s runs its own DNS server, so cluster DNS cannot start; remove its containers to fix", networkName)
+			return nil
+		}
 		if info.Count > 0 {
 			return fmt.Errorf("docker network %s has subnet %s but this node now owns %s; remove its containers to migrate", networkName, info.Subnet, subnet)
 		}

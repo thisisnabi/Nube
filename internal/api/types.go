@@ -57,7 +57,7 @@ type NodeInfo struct {
 	Kernel        string `json:"kernel,omitempty"`
 	Arch          string `json:"arch,omitempty"`
 	RuntimeVer    string `json:"runtimeVersion,omitempty"`
-	Runtime       string `json:"runtime,omitempty"`
+	Runtime       string `json:"runtime,omitempty"` // docker | podman
 	AgentVersion  string `json:"agentVersion,omitempty"`
 	ContainerHost string `json:"containerHost,omitempty"`
 }
@@ -74,13 +74,14 @@ type Node struct {
 	Usage         Resources         `json:"usage"`     // live usage reported by agent
 	Info          NodeInfo          `json:"info"`
 	PodCount      int               `json:"podCount"`
-	PodCIDR       string            `json:"podCIDR,omitempty"`     // e.g. 10.88.3.0/24, allocated by the server
+	PodCIDR       string            `json:"podCIDR,omitempty"`     // e.g. 10.244.3.0/24, allocated by the server
 	NetworkMode   string            `json:"networkMode,omitempty"` // none | host-gw | wireguard
 	WGPublicKey   string            `json:"wgPublicKey,omitempty"`
 	WGPort        int               `json:"wgPort,omitempty"`
 	NetworkReady  bool              `json:"networkReady"`
 	NetworkError  string            `json:"networkError,omitempty"`
-	TLS           bool              `json:"tls"` // agent API is served with a cluster-signed certificate
+	TLS           bool              `json:"tls"`                // agent API is served with a cluster-signed certificate
+	Firewall      string            `json:"firewall,omitempty"` // network policy / service routing status
 	LastHeartbeat time.Time         `json:"lastHeartbeat"`
 	JoinedAt      time.Time         `json:"joinedAt"`
 }
@@ -407,6 +408,27 @@ type VolumeSpec struct {
 	NodeName string     `json:"nodeName,omitempty"`
 	NFS      *NFSSource `json:"nfs,omitempty"`
 	HostPath string     `json:"hostPath,omitempty"`
+	// AccessMode for nfs volumes: ReadWriteMany (default, shared, size not
+	// enforced) or ReadWriteOnce (one node at a time, size enforced: an ext4
+	// image on the share, so pods can move to any node with their data).
+	AccessMode string `json:"accessMode,omitempty"`
+	// RestoreFrom fills a new volume from a VolumeSnapshot before first use.
+	RestoreFrom string `json:"restoreFrom,omitempty"`
+	// Backup takes snapshots on a schedule.
+	Backup *VolumeBackup `json:"backup,omitempty"`
+	// AutoRecover: if the node holding this local volume is lost, restore the
+	// latest snapshot on another node (data since that snapshot is lost).
+	AutoRecover bool `json:"autoRecover,omitempty"`
+}
+
+// VolumeMigration tracks moving a local volume to another node.
+type VolumeMigration struct {
+	Target   string    `json:"target"`
+	Phase    string    `json:"phase"` // Draining | Snapshotting | Restoring | Done | Failed
+	Snapshot string    `json:"snapshot,omitempty"`
+	Started  time.Time `json:"started"`
+	Message  string    `json:"message,omitempty"`
+	Reason   string    `json:"reason,omitempty"` // move | recover
 }
 
 type VolumeStatus struct {
@@ -417,6 +439,12 @@ type VolumeStatus struct {
 	CapacityMiB int64    `json:"capacityMiB"`
 	Enforced    bool     `json:"enforced"` // the size limit is enforced by the filesystem
 	Message     string   `json:"message,omitempty"`
+	// RestoreFrom is the snapshot the bound node must restore before use
+	// (from spec.restoreFrom, a migration or a recovery).
+	RestoreFrom string           `json:"restoreFrom,omitempty"`
+	Restored    string           `json:"restored,omitempty"` // snapshot the node reported as restored
+	Migration   *VolumeMigration `json:"migration,omitempty"`
+	LastBackup  time.Time        `json:"lastBackup,omitempty"`
 }
 
 type Volume struct {
@@ -541,7 +569,11 @@ type IngressRule struct {
 
 type IngressTLS struct {
 	Hosts      []string `json:"hosts"`
-	SecretName string   `json:"secretName,omitempty"` // Secret of type tls; empty = self-signed
+	SecretName string   `json:"secretName,omitempty"` // Secret of type tls
+	// ACME obtains and renews certificates automatically (Let's Encrypt or the
+	// server's --acme-directory). Without SecretName or ACME, a self-signed
+	// certificate is served.
+	ACME bool `json:"acme,omitempty"`
 }
 
 type IngressSpec struct {
@@ -665,6 +697,8 @@ type SyncRequest struct {
 	Pods    []PodReport    `json:"pods"`
 	Volumes []VolumeReport `json:"volumes,omitempty"`
 	CSR     string         `json:"csr,omitempty"` // PEM certificate request for the agent API
+	// Restored lists volumes ("ns/name=snapshot") filled from a snapshot.
+	Restored []string `json:"restored,omitempty"`
 }
 
 // AssignedPod is a pod the agent should run, with env and volumes already resolved.
@@ -719,25 +753,33 @@ type SyncResponse struct {
 	Records     map[string]string `json:"records,omitempty"`     // extra DNS names (without domain), e.g. "db-0.db.default.svc"
 	Certificate string            `json:"certificate,omitempty"` // signed agent cert (PEM), answer to SyncRequest.CSR
 	CA          string            `json:"ca,omitempty"`          // cluster CA (PEM)
+	Firewall    []PodFirewall     `json:"firewall,omitempty"`    // network policies for this node's pods
+	Snapshots   []SnapshotTask    `json:"snapshots,omitempty"`   // snapshots this node must take
+	APIServers  []string          `json:"apiServers,omitempty"`  // for NUBE_API_SERVER in pods
 }
 
 // Overview is the single payload the dashboard polls.
 type Overview struct {
-	Version      string         `json:"version"`
-	StartedAt    time.Time      `json:"startedAt"`
-	Nodes        []*Node        `json:"nodes"`
-	Deployments  []*Deployment  `json:"deployments"`
-	StatefulSets []*StatefulSet `json:"statefulSets"`
-	Jobs         []*Job         `json:"jobs"`
-	CronJobs     []*CronJob     `json:"cronJobs"`
-	Pods         []*Pod         `json:"pods"`
-	Services     []*Service     `json:"services"`
-	Ingresses    []*Ingress     `json:"ingresses"`
-	ConfigMaps   []*ConfigMap   `json:"configMaps"`
-	Secrets      []*Secret      `json:"secrets"`
-	Volumes      []*Volume      `json:"volumes"`
-	Events       []Event        `json:"events"`
-	Namespaces   []string       `json:"namespaces"`
-	Cluster      ClusterInfo    `json:"cluster"`
-	Me           Identity       `json:"me"`
+	Version      string                      `json:"version"`
+	StartedAt    time.Time                   `json:"startedAt"`
+	Nodes        []*Node                     `json:"nodes"`
+	Deployments  []*Deployment               `json:"deployments"`
+	StatefulSets []*StatefulSet              `json:"statefulSets"`
+	Jobs         []*Job                      `json:"jobs"`
+	CronJobs     []*CronJob                  `json:"cronJobs"`
+	Pods         []*Pod                      `json:"pods"`
+	Services     []*Service                  `json:"services"`
+	Ingresses    []*Ingress                  `json:"ingresses"`
+	ConfigMaps   []*ConfigMap                `json:"configMaps"`
+	Secrets      []*Secret                   `json:"secrets"`
+	Volumes      []*Volume                   `json:"volumes"`
+	DaemonSets   []*DaemonSet                `json:"daemonSets"`
+	Policies     []*NetworkPolicy            `json:"networkPolicies"`
+	Snapshots    []*VolumeSnapshot           `json:"snapshots"`
+	CRDs         []*CustomResourceDefinition `json:"crds"`
+	Custom       []*CustomObject             `json:"custom"`
+	Events       []Event                     `json:"events"`
+	Namespaces   []string                    `json:"namespaces"`
+	Cluster      ClusterInfo                 `json:"cluster"`
+	Me           Identity                    `json:"me"`
 }
