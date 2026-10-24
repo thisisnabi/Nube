@@ -1,24 +1,88 @@
-# Nube — یک ارکستریتور کانتینر شبیه Kubernetes، از صفر
+# Nube — ارکستریتور agentهای هوش مصنوعی، و کانتینرهای اطرافشان
 
-Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور کانتینر کوچک ولی واقعی است که با Go نوشته شده.
-یک باینری (`nube`) هم control plane است، هم agent نودها و هم CLI. یک داشبورد وب هم داخلش embed شده.
-کانتینرها روی Docker یا Podman اجرا می‌شوند. Nube **agentهای هوش مصنوعی** (Claude یا هر مدل سازگار با OpenAI) را هم مثل
-یک workload اجرا می‌کند، و agentها می‌توانند از طریق MCP به‌صورت امن **خود کلاستر را مدیریت کنند**.
+Nube (به اسپانیایی یعنی «ابر») **agentهای هوش مصنوعی را مثل یک workload اجرا می‌کند**. یک agent تعریف می‌کنید (مدل،
+دستورالعمل و ابزارها) و هر کاری که به آن بدهید در pod خودش اجرا می‌شود: دستورهایی که مدل می‌نویسد در یک کانتینر sandbox
+جدا اجرا می‌شوند، فراخوانی ابزارهای پرخطر منتظر تأیید انسان می‌مانند، و هر run بودجه، trace کامل، حافظه و در صورت نیاز
+زمان‌بندی دارد. agentها می‌توانند **خود Nube را هم مدیریت کنند**: یک MCP server داخلی، نقش `agent` که تغییرات مخربش
+منتظر تأیید می‌ماند، و audit log.
 
-[English](README.md)
+زیر آن یک ارکستریتور کوچک ولی واقعی شبیه Kubernetes است که با Go از صفر نوشته شده. یک باینری (`nube`) هم control plane
+است، هم daemon نودها و هم CLI، و یک داشبورد وب هم داخلش embed شده. کانتینرها را روی Docker یا Podman روی یک یا چند ماشین
+لینوکسی اجرا می‌کند، آن‌ها را با WireGuard به هم وصل می‌کند و از دست رفتن یک نود یا یک سرور control plane را تحمل می‌کند.
+
+[English](README.md) · [AGENTS.md](AGENTS.md) (راهنمای agentهایی که Nube را مدیریت می‌کنند) · [examples/agents](examples/agents)
 
 ```
-                 ┌──────────── control plane (۱ یا ۳ سرور، Raft، HTTPS) ────────────┐
-   nube CLI ───► │ REST API · RBAC · scheduler · controllers · LB · Ingress · UI   │
-   مرورگر   ───► │ state store (فایل JSON یا Raft تکثیرشده) · cluster CA          │
-                 └──────────────▲──────────────────────────────▲──────────────────┘
-                   sync (HTTPS + node token)        sync (HTTPS + node token)
-                 ┌──────────────┴─────────┐   ┌────────────────┴───────┐
-                 │ node agent  (Docker)   │   │ node agent  (Podman)   │
-                 │ pods 10.244.1.0/24     │◄─►│ pods 10.244.2.0/24     │
-                 │ DNS + service proxy    │ WireGuard   DNS + proxy    │
-                 └────────────────────────┘   └────────────────────────┘
+  nube CLI · dashboard · Claude Code and other agents (MCP)
+                   │ HTTPS · tokens with roles
+  ┌───────────────────────────────────────────────────────────────────┐
+  │ control plane (1 or 3 servers, Raft)                              │
+  │ API · MCP server · approvals · audit log · dashboard              │
+  │ scheduler · controllers · agent queue, budgets, traces            │
+  └───────────────────────────────────────────────────────────────────┘
+                   │                                  │   sync (mutual TLS)
+  ┌───────────────────────────────┐   ┌───────────────────────────────┐
+  │ node (Docker)                 │   │ node (Podman)                 │
+  │ ┌ agent run pod ────────────┐ │   │ your services and databases   │
+  │ │ runtime ──► Claude / LLM  │ │◄─►│ model servers (vLLM, Ollama)  │
+  │ │ sandbox: model's commands │ │ WG│ more agent runs               │
+  │ └───────────────────────────┘ │   └───────────────────────────────┘
+  └───────────────────────────────┘
 ```
+
+## چرا agentها را روی Nube اجرا کنیم
+
+| نیاز | آنچه Nube می‌دهد |
+|---|---|
+| **ایزوله‌سازی** | هر run یک pod جداست. دستورهایی که مدل می‌نویسد در یک کانتینر sandbox کنار runtime اجرا می‌شوند، نه داخل آن و نه کنار کلیدهای API شما |
+| **انسان در حلقه** | ابزارهایی که `requireApproval` دارند منتظر `nube approve` (یا یک کلیک در داشبورد) می‌مانند؛ اگر رد کنید، agent دلیلش را می‌شنود |
+| **بودجه** | سقف step، token و زمان برای هر run؛ صف با سقف همزمانی برای هر agent |
+| **دیدن همه‌چیز** | trace هر فراخوانی مدل و ابزار با token و زمان (`nube trace -w` و داشبورد) و audit log همه‌ی تغییرات |
+| **هر مدلی** | Claude از طریق SDK رسمی Anthropic، یا هر سرور سازگار با OpenAI (vLLM، Ollama و ...) که روی همین کلاستر اجرا می‌شود |
+| **ابزار واقعی** | سرویس‌های کلاستر از طریق HTTP، سرورهای MCP، sandbox برای shell، agentهای دیگر (واگذاری) و خود Nube |
+| **حافظه و زمان‌بندی** | حافظه‌ی گفتگو برای هر session؛ زمان‌بندی cron که run را خودکار شروع می‌کند |
+| **agentی که کلاستر را می‌گرداند** | ابزارهای خود Nube را به agent بدهید (`nube: {role: view}`، یا `agent` برای تغییر با تأیید انسان) |
+
+## agentها در یک دقیقه
+
+```yaml
+kind: Agent
+metadata: { name: ops-assistant }
+spec:
+  model: { name: claude-opus-5-5, apiKeySecret: anthropic }   # Secret با کلید ANTHROPIC_API_KEY
+  instructions: You help operate this cluster. Diagnose before changing anything.
+  tools:
+    - nube: { role: view }                       # ابزارهای خود Nube: diagnose، لاگ، رویدادها ...
+    - name: shell
+      sandbox: { image: "alpine:3.20" }          # دستورها در یک کانتینر جدا اجرا می‌شوند
+      requireApproval: true                      # هر فراخوانی را یک انسان تأیید می‌کند
+    - agent: { name: researcher }                # واگذاری به agent دیگر (ابزار ask_researcher)
+  memory: { enabled: true }
+  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
+  schedules: [{ cron: "0 8 * * 1-5", input: "Summarize what needs attention today" }]
+```
+
+```bash
+nube run ops-assistant "Why is web degraded?" --session alice --wait
+nube trace RUN -w          # فراخوانی‌های مدل و ابزار، token‌ها و خروجی
+nube approvals             # فراخوانی‌هایی که منتظر انسان‌اند؛ nube approve|reject ID
+```
+
+control plane هر run را در صف می‌گذارد (همزمانی برای هر agent)، یک pod با **runtime** (imageای که هر نود از باینری `nube` خودش
+می‌سازد) و یک کانتینر برای هر ابزار sandbox می‌سازد، و به runtime توکنی می‌دهد که فقط برای همان run معتبر است و هیچ‌جا ذخیره
+نمی‌شود. runtime حلقه‌ی agent را با SDK رسمی Anthropic برای Go (یا کلاینت سازگار با OpenAI) اجرا می‌کند، هر گام را گزارش می‌دهد،
+برای تأیید می‌پرسد و با رسیدن به سقف step، token یا زمان متوقف می‌شود. نمونه‌ها در [`examples/agents`](examples/agents).
+
+## مدیریت به دست agentهای هوش مصنوعی
+
+```bash
+nube token create claude --role agent -n staging     # تغییر مجاز است؛ تغییرات مخرب منتظر انسان می‌مانند
+claude mcp add nube -- nube mcp                      # Claude Code (یا هر کلاینت MCP) ابزارهای Nube را می‌گیرد
+```
+
+ابزارهای MCP (`cluster_overview`، `diagnose`، `get_logs`، `explain`، `apply_manifest` با `dry_run`، `scale`، `rollout`،
+`delete_resource`، `run_agent` و ...) فراخوانی عادی API با توکن خود فراخوان هستند: نقش، namespace، تأیید و audit log
+همه اعمال می‌شوند. راهنما: [AGENTS.md](AGENTS.md).
 
 ## قابلیت‌ها
 
@@ -90,49 +154,6 @@ managed، و هر جا که یک پلتفرم استاندارد و آزموده
   OpenAI-compatible، تأییدها، محدودیت token، صف و timeout با تست در برابر API‌های شبیه‌سازی‌شده پوشش داده شده‌اند.
 - **Rollout هوشمند:** روی دو نود Podman، تغییر ConfigMap باعث rolling restart شد و سرویس مقدار جدید را برگرداند؛ کلاینتی با
   `dependsOn: [db]` تا آماده‌شدن db صبر کرد؛ rollout به imageای که وجود نداشت podهای قدیمی را نگه داشت و بعد از ۴۰ ثانیه خودکار rollback شد.
-
----
-
-## Agentهای هوش مصنوعی
-
-```yaml
-kind: Agent
-metadata: { name: ops-assistant }
-spec:
-  model: { name: claude-opus-5-5, apiKeySecret: anthropic }   # Secret با کلید ANTHROPIC_API_KEY
-  instructions: You help operate this cluster. Diagnose before changing anything.
-  tools:
-    - nube: { role: view }                       # ابزارهای خود Nube: diagnose، لاگ، رویدادها ...
-    - name: shell
-      sandbox: { image: "alpine:3.20" }          # دستورها در یک کانتینر جدا اجرا می‌شوند
-      requireApproval: true                      # هر فراخوانی را یک انسان تأیید می‌کند
-    - agent: { name: researcher }                # واگذاری به agent دیگر (ابزار ask_researcher)
-  memory: { enabled: true }
-  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
-  schedules: [{ cron: "0 8 * * 1-5", input: "Summarize what needs attention today" }]
-```
-
-```bash
-nube run ops-assistant "Why is web degraded?" --session alice --wait
-nube trace RUN -w          # فراخوانی‌های مدل و ابزار، token‌ها و خروجی
-nube approvals             # فراخوانی‌هایی که منتظر انسان‌اند؛ nube approve|reject ID
-```
-
-control plane هر run را در صف می‌گذارد (همزمانی برای هر agent)، یک pod با **runtime** (imageای که هر نود از باینری `nube` خودش
-می‌سازد) و یک کانتینر برای هر ابزار sandbox می‌سازد، و به runtime توکنی می‌دهد که فقط برای همان run معتبر است و هیچ‌جا ذخیره
-نمی‌شود. runtime حلقه‌ی agent را با SDK رسمی Anthropic برای Go (یا کلاینت سازگار با OpenAI) اجرا می‌کند، هر گام را گزارش می‌دهد،
-برای تأیید می‌پرسد و با رسیدن به سقف step، token یا زمان متوقف می‌شود. نمونه‌ها در [`examples/agents`](examples/agents).
-
-## مدیریت به دست agentهای هوش مصنوعی
-
-```bash
-nube token create claude --role agent -n staging     # تغییر مجاز است؛ تغییرات مخرب منتظر انسان می‌مانند
-claude mcp add nube -- nube mcp                      # Claude Code (یا هر کلاینت MCP) ابزارهای Nube را می‌گیرد
-```
-
-ابزارهای MCP (`cluster_overview`، `diagnose`، `get_logs`، `explain`، `apply_manifest` با `dry_run`، `scale`، `rollout`،
-`delete_resource`، `run_agent` و ...) فراخوانی عادی API با توکن خود فراخوان هستند: نقش، namespace، تأیید و audit log
-همه اعمال می‌شوند. راهنما: [AGENTS.md](AGENTS.md).
 
 ---
 

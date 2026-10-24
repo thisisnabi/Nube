@@ -1,29 +1,97 @@
 # Nube
 
-**A small, real Kubernetes-like container orchestrator, written from scratch in Go.**
+**The orchestrator for AI agents, and for the containers around them. Written from scratch in Go.**
 
-One binary (`nube`) is the control plane, the node agent and the CLI, with a web dashboard built in.
-It runs your containers on Docker or Podman across one or many Linux machines, keeps them healthy, networks them
-together, and survives the loss of a node or a control-plane server. It also **runs AI agents** (Claude or any
-OpenAI-compatible model) as first-class workloads, and AI agents can **operate it** safely through MCP.
+Nube **runs AI agents as workloads**. You declare an agent (a model, instructions and tools), and every task it gets
+runs in its own pod: the commands the model writes go to a separate sandbox container, risky tool calls wait for a
+human, and every run has a budget, a full trace, memory and, if you like, a schedule. Agents can also **operate Nube**:
+it has a built-in MCP server, an `agent` role whose destructive changes wait for approval, and an audit log.
 
-[فارسی](README.fa.md)
+Underneath is a small but real Kubernetes-like orchestrator. One binary (`nube`) is the control plane, the node daemon
+and the CLI, with a web dashboard built in. It runs containers on Docker or Podman across one or many Linux machines,
+networks them with WireGuard, and survives the loss of a node or a control-plane server.
+
+[فارسی](README.fa.md) · [AGENTS.md](AGENTS.md) (for AI agents operating Nube) · [examples/agents](examples/agents)
 
 ```
-                ┌──────────── control plane (1 or 3 servers, Raft, HTTPS) ────────────┐
-  nube CLI ───► │  REST API · RBAC · scheduler · controllers · LB · Ingress · UI      │
-  browser  ───► │  state store (JSON file or Raft-replicated) · cluster CA           │
-                └───────────────▲───────────────────────────────▲─────────────────────┘
-                  sync (HTTPS + node token)         sync (HTTPS + node token)
-                ┌───────────────┴────────┐   ┌──────────────────┴─────┐
-                │ node agent  (Docker)   │   │ node agent  (Podman)   │
-                │ pods 10.244.1.0/24     │◄─►│ pods 10.244.2.0/24     │
-                │ DNS + service proxy    │ WireGuard   DNS + proxy    │
-                └────────────────────────┘   └────────────────────────┘
+  nube CLI · dashboard · Claude Code and other agents (MCP)
+                   │ HTTPS · tokens with roles
+  ┌───────────────────────────────────────────────────────────────────┐
+  │ control plane (1 or 3 servers, Raft)                              │
+  │ API · MCP server · approvals · audit log · dashboard              │
+  │ scheduler · controllers · agent queue, budgets, traces            │
+  └───────────────────────────────────────────────────────────────────┘
+                   │                                  │   sync (mutual TLS)
+  ┌───────────────────────────────┐   ┌───────────────────────────────┐
+  │ node (Docker)                 │   │ node (Podman)                 │
+  │ ┌ agent run pod ────────────┐ │   │ your services and databases   │
+  │ │ runtime ──► Claude / LLM  │ │◄─►│ model servers (vLLM, Ollama)  │
+  │ │ sandbox: model's commands │ │ WG│ more agent runs               │
+  │ └───────────────────────────┘ │   └───────────────────────────────┘
+  └───────────────────────────────┘
 ```
 
-> Nube is built for learning how orchestrators really work, for homelabs and for personal projects.
-> It is not a drop-in replacement for Kubernetes in production — see [Limitations](#limitations).
+> Nube is built for homelabs, personal projects and learning how orchestrators really work.
+> It is not a drop-in replacement for Kubernetes in production; see [Limitations](#limitations).
+
+## Why run AI agents on Nube
+
+| You need | Nube gives you |
+|---|---|
+| **Isolation** | Every run is its own pod. Commands the model writes run in a sandbox container next to the runtime, never in it, and never next to your API keys |
+| **A human in the loop** | Tools marked `requireApproval` wait for `nube approve` (or a click in the dashboard); the agent hears the reason if you reject |
+| **Budgets** | Step, token and time limits per run; a queue with a concurrency limit per agent |
+| **Visibility** | A trace of every model call and tool call with tokens and timings (`nube trace -w`, dashboard) and an audit log of every change |
+| **Any model** | Claude through the official Anthropic SDK, or any OpenAI-compatible server (vLLM, Ollama ...) running in the same cluster |
+| **Real tools** | Services in the cluster over HTTP, MCP servers, a shell sandbox, other agents (delegation), and Nube itself |
+| **Memory and schedules** | Conversation memory per session; cron schedules that start runs on their own |
+| **An agent that runs the cluster** | Give an agent Nube's own tools (`nube: {role: view}`, or `agent` to make changes under approval) |
+
+## AI agents in a minute
+
+```yaml
+kind: Agent
+metadata: { name: ops-assistant }
+spec:
+  model: { name: claude-opus-5-5, apiKeySecret: anthropic }   # Secret with ANTHROPIC_API_KEY
+  instructions: You help operate this cluster. Diagnose before changing anything.
+  tools:
+    - nube: { role: view }                       # Nube's own tools: diagnose, logs, events ...
+    - name: shell
+      sandbox: { image: "alpine:3.20" }          # commands run in a separate container
+      requireApproval: true                      # a human approves each call
+    - name: search_kb
+      http: { service: kb, port: 8080, path: /search }
+      inputSchema: { type: object, properties: { q: { type: string } }, required: [q] }
+    - agent: { name: researcher }                # delegate to another agent (tool ask_researcher)
+  memory: { enabled: true }
+  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
+  schedules: [{ cron: "0 8 * * 1-5", input: "Summarize what needs attention today" }]
+```
+
+```bash
+nube run ops-assistant "Why is web degraded?" --session alice --wait
+nube trace RUN -w          # model calls, tool calls, tokens, output
+nube approvals             # tool calls waiting for a human; nube approve|reject ID
+nube memory ops-assistant --session alice
+```
+
+How it works: the control plane queues each run (per-agent concurrency), creates a pod with the **runtime** (an image
+every node builds from its own `nube` binary) and one container per sandbox tool, and gives the runtime a token that is
+valid for that run only and never stored. The runtime runs the agent loop with the official Anthropic Go SDK (or an
+OpenAI-compatible client), reports every step, asks for approvals and stops at the step, token or time budget.
+More in [`examples/agents`](examples/agents) and `nube explain agent`.
+
+## Operated by AI agents
+
+```bash
+nube token create claude --role agent -n staging     # changes allowed; destructive ones wait for a human
+claude mcp add nube -- nube mcp                      # Claude Code (or any MCP client) gets Nube's tools
+```
+
+The MCP tools (`cluster_overview`, `diagnose`, `get_logs`, `explain`, `apply_manifest` with `dry_run`, `scale`,
+`set_image`, `rollout`, `delete_resource`, `run_agent` ...) are ordinary API calls with the caller's token: roles,
+namespaces, approvals and the audit log apply. See [AGENTS.md](AGENTS.md).
 
 ## Features
 
@@ -99,54 +167,6 @@ On a Docker test cluster (3 HA servers with TLS + Docker-in-Docker and Podman no
   memory and was cleaned up; a rejected command reached the model as a refusal; the stdio MCP bridge served `diagnose`
   and `run_agent`; the Claude (official Go SDK) and OpenAI-compatible adapters, approvals, token scoping, queueing and
   timeouts are covered by tests against mock APIs.
-
----
-
-## AI agents
-
-```yaml
-kind: Agent
-metadata: { name: ops-assistant }
-spec:
-  model: { name: claude-opus-5-5, apiKeySecret: anthropic }   # Secret with ANTHROPIC_API_KEY
-  instructions: You help operate this cluster. Diagnose before changing anything.
-  tools:
-    - nube: { role: view }                       # Nube's own tools: diagnose, logs, events ...
-    - name: shell
-      sandbox: { image: "alpine:3.20" }          # commands run in a separate container
-      requireApproval: true                      # a human approves each call
-    - name: search_kb
-      http: { service: kb, port: 8080, path: /search }
-      inputSchema: { type: object, properties: { q: { type: string } }, required: [q] }
-    - agent: { name: researcher }                # delegate to another agent (tool ask_researcher)
-  memory: { enabled: true }
-  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
-  schedules: [{ cron: "0 8 * * 1-5", input: "Summarize what needs attention today" }]
-```
-
-```bash
-nube run ops-assistant "Why is web degraded?" --session alice --wait
-nube trace RUN -w          # model calls, tool calls, tokens, output
-nube approvals             # tool calls waiting for a human; nube approve|reject ID
-nube memory ops-assistant --session alice
-```
-
-How it works: the control plane queues each run (per-agent concurrency), creates a pod with the **runtime** (an image
-every node builds from its own `nube` binary) and one container per sandbox tool, and gives the runtime a token that is
-valid for that run only and never stored. The runtime runs the agent loop with the official Anthropic Go SDK (or an
-OpenAI-compatible client), reports every step, asks for approvals and stops at the step, token or time budget.
-More in [`examples/agents`](examples/agents) and `nube explain agent`.
-
-## Operated by AI agents
-
-```bash
-nube token create claude --role agent -n staging     # changes allowed; destructive ones wait for a human
-claude mcp add nube -- nube mcp                      # Claude Code (or any MCP client) gets Nube's tools
-```
-
-The MCP tools (`cluster_overview`, `diagnose`, `get_logs`, `explain`, `apply_manifest` with `dry_run`, `scale`,
-`set_image`, `rollout`, `delete_resource`, `run_agent` ...) are ordinary API calls with the caller's token: roles,
-namespaces, approvals and the audit log apply. See [AGENTS.md](AGENTS.md).
 
 ---
 
