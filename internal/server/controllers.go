@@ -82,6 +82,8 @@ func (s *Server) controllerLoop(ctx context.Context) {
 			for _, key := range sortedKeys(st.DaemonSets) {
 				reconcileDaemonSet(st, st.DaemonSets[key], now)
 			}
+			reconcileApprovals(st, now)
+			reconcileAgents(st, now)
 			reconcileBackups(st, now)
 			reconcileSnapshots(st, now)
 			reconcileMigrations(st, now, s.live.lastSeen)

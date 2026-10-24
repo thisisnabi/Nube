@@ -36,6 +36,12 @@ type State struct {
 	CRDs         map[string]*api.CustomResourceDefinition `json:"crds"`   // by kind
 	Custom       map[string]*api.CustomObject             `json:"custom"` // by "Kind|ns/name"
 	Snapshots    map[string]*api.VolumeSnapshot           `json:"snapshots"`
+	Approvals    map[string]*api.Approval                 `json:"approvals"`
+	Agents       map[string]*api.Agent                    `json:"agents"`
+	AgentRuns    map[string]*api.AgentRun                 `json:"agentRuns"`
+	AgentMemory  map[string][]api.MemoryMessage           `json:"agentMemory"` // by ns/agent/session
+	Audit        map[string]*api.AuditEntry               `json:"audit"`       // by zero-padded seq
+	AuditSeq     int64                                    `json:"auditSeq"`
 	ACME         map[string][]byte                        `json:"acme"`     // certificate cache shared by all servers
 	Revision     int64                                    `json:"revision"` // bumped on custom-object changes (watch)
 	Servers      map[string]*api.ServerMember             `json:"servers"`
@@ -113,6 +119,21 @@ func (s *State) init() {
 	}
 	if s.ACME == nil {
 		s.ACME = map[string][]byte{}
+	}
+	if s.Approvals == nil {
+		s.Approvals = map[string]*api.Approval{}
+	}
+	if s.Agents == nil {
+		s.Agents = map[string]*api.Agent{}
+	}
+	if s.AgentRuns == nil {
+		s.AgentRuns = map[string]*api.AgentRun{}
+	}
+	if s.AgentMemory == nil {
+		s.AgentMemory = map[string][]api.MemoryMessage{}
+	}
+	if s.Audit == nil {
+		s.Audit = map[string]*api.AuditEntry{}
 	}
 }
 
@@ -200,6 +221,9 @@ func (s *State) Namespaces() []string {
 	for _, v := range s.Policies {
 		set[v.Metadata.Namespace] = true
 	}
+	for _, v := range s.Agents {
+		set[v.Metadata.Namespace] = true
+	}
 	for _, v := range s.Custom {
 		set[v.Metadata.Namespace] = true
 	}
@@ -243,4 +267,17 @@ func (s *State) CRDByName(name string) *api.CustomResourceDefinition {
 		}
 	}
 	return nil
+}
+
+// Clone returns a deep copy (for dry runs).
+func (s *State) Clone() *State {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	c, err := decodeState(b)
+	if err != nil {
+		panic(err)
+	}
+	return c
 }

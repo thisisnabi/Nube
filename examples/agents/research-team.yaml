@@ -1,0 +1,25 @@
+# Two agents working together: the writer delegates research to the
+# researcher (a child run, with its own pod, budget and trace) and writes the
+# answer. The researcher uses a cheaper model and an MCP server in the cluster.
+#
+#   nube run writer "Compare WireGuard and VXLAN for a home cluster" --wait
+kind: Agent
+metadata: { name: researcher }
+spec:
+  model: { name: claude-haiku-5-5, apiKeySecret: anthropic }
+  instructions: Find the facts asked for and return them as short, sourced notes.
+  tools:
+    - name: docs
+      mcp: { service: docs-mcp, port: 8000, path: /mcp }   # any MCP server (streamable HTTP)
+  limits: { maxSteps: 15, concurrency: 4 }
+---
+kind: Agent
+metadata: { name: writer }
+spec:
+  model: { name: claude-opus-5-5, apiKeySecret: anthropic }
+  instructions: |
+    You write clear technical answers. Ask the researcher for the facts you
+    need (one focused question per call), then write the answer.
+  tools:
+    - agent: { name: researcher }        # becomes the tool "ask_researcher"
+  limits: { maxSteps: 20, timeoutSeconds: 1200 }

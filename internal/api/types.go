@@ -811,6 +811,9 @@ type Overview struct {
 	Snapshots    []*VolumeSnapshot           `json:"snapshots"`
 	CRDs         []*CustomResourceDefinition `json:"crds"`
 	Custom       []*CustomObject             `json:"custom"`
+	Agents       []*Agent                    `json:"agents"`
+	AgentRuns    []*AgentRun                 `json:"agentRuns"` // newest first, without their steps
+	Approvals    []Approval                  `json:"approvals"` // pending, then recently decided
 	Events       []Event                     `json:"events"`
 	Namespaces   []string                    `json:"namespaces"`
 	Cluster      ClusterInfo                 `json:"cluster"`

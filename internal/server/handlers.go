@@ -32,6 +32,27 @@ func (s *Server) routes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("GET /api/v1/whoami", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, identityFrom(r)) })
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
+	mux.HandleFunc("GET /api/v1/diagnose", s.handleDiagnose)
+	mux.HandleFunc("GET /api/v1/approvals", s.handleApprovalList)
+	mux.HandleFunc("GET /api/v1/approvals/{id}", s.handleApprovalGet)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/{action}", s.handleApprovalDecide)
+	mux.HandleFunc("GET /api/v1/audit", s.handleAudit)
+	mux.HandleFunc("POST /api/v1/mcp", s.handleMCP)
+	mux.HandleFunc("GET /api/v1/mcp", s.handleMCP)
+	mux.HandleFunc("GET /api/v1/schema", s.handleSchemaList)
+	mux.HandleFunc("GET /api/v1/schema/{kind}", s.handleSchemaKind)
+
+	mux.HandleFunc("POST /api/v1/namespaces/{ns}/agents/{name}/runs", s.handleAgentRunCreate)
+	mux.HandleFunc("GET /api/v1/namespaces/{ns}/agents/{name}/memory", s.handleAgentMemory)
+	mux.HandleFunc("POST /api/v1/namespaces/{ns}/agentruns/{name}/cancel", s.handleAgentRunCancel)
+	mux.HandleFunc("GET /api/v1/runtime/run", s.handleRuntimeRun)
+	mux.HandleFunc("POST /api/v1/runtime/steps", s.handleRuntimeStep)
+	mux.HandleFunc("POST /api/v1/runtime/finish", s.handleRuntimeFinish)
+	mux.HandleFunc("POST /api/v1/runtime/approvals", s.handleRuntimeApproval)
+	mux.HandleFunc("GET /api/v1/runtime/approvals/{id}", s.handleRuntimeApprovalGet)
+	mux.HandleFunc("POST /api/v1/runtime/mcp", s.handleRuntimeMCP)
+	mux.HandleFunc("POST /api/v1/runtime/subruns", s.handleRuntimeSubrun)
+	mux.HandleFunc("GET /api/v1/runtime/subruns/{name}", s.handleRuntimeSubrunGet)
 
 	mux.HandleFunc("GET /api/v1/cluster", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, s.clusterInfo()) })
 	mux.HandleFunc("POST /api/v1/cluster/join", s.handleJoin)
@@ -196,6 +217,35 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		for i, d := range ov.Deployments {
 			ov.Deployments[i] = s.present(api.KindDeployment, d, false).(*api.Deployment)
 		}
+		ov.Agents = visible(id, sortedValues(st.Agents, func(v *api.Agent) string { return v.Metadata.Key() }), func(d *api.Agent) string { return d.Metadata.Namespace })
+		ov.AgentRuns = []*api.AgentRun{}
+		for _, r := range visible(id, sortedValues(st.AgentRuns, func(v *api.AgentRun) string { return v.Metadata.CreatedAt.Format(time.RFC3339Nano) }), func(d *api.AgentRun) string { return d.Metadata.Namespace }) {
+			c := *r
+			c.Status.Steps = nil
+			ov.AgentRuns = append([]*api.AgentRun{&c}, ov.AgentRuns...)
+		}
+		if len(ov.AgentRuns) > 200 {
+			ov.AgentRuns = ov.AgentRuns[:200]
+		}
+		ov.Approvals = []api.Approval{}
+		for _, a := range st.Approvals {
+			if id.Role != api.RoleAdmin && a.Requester != id.Name && !(a.Namespace != "" && nsAllowed(id, a.Namespace)) {
+				continue
+			}
+			c := *a
+			c.Body = nil
+			ov.Approvals = append(ov.Approvals, c)
+		}
+		sort.Slice(ov.Approvals, func(i, j int) bool {
+			pi, pj := ov.Approvals[i].Status == "Pending", ov.Approvals[j].Status == "Pending"
+			if pi != pj {
+				return pi
+			}
+			return ov.Approvals[i].CreatedAt.After(ov.Approvals[j].CreatedAt)
+		})
+		if len(ov.Approvals) > 100 {
+			ov.Approvals = ov.Approvals[:100]
+		}
 		for i, d := range ov.StatefulSets {
 			ov.StatefulSets[i] = s.present(api.KindStatefulSet, d, false).(*api.StatefulSet)
 		}
@@ -285,6 +335,14 @@ func namespaced(st *store.State, kind string) map[string]any {
 		}
 	case api.KindNetworkPolicy:
 		for k, v := range st.Policies {
+			add(k, v)
+		}
+	case api.KindAgent:
+		for k, v := range st.Agents {
+			add(k, v)
+		}
+	case api.KindAgentRun:
+		for k, v := range st.AgentRuns {
 			add(k, v)
 		}
 	case api.KindVolumeSnapshot:
@@ -384,7 +442,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, kind, ns, nam
 			v = s.present(kind, o, reveal)
 		}
 		if v == nil {
-			return 404, map[string]string{"error": fmt.Sprintf("%s %q not found", strings.ToLower(kind), name)}
+			code, hint := errorCode(404)
+			return 404, apiError{Error: fmt.Sprintf("%s %q not found", strings.ToLower(kind), name), Code: code, Hint: hint}
 		}
 		return 200, v
 	})
@@ -464,25 +523,41 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	sort.SliceStable(objs, func(i, j int) bool { return order[objs[i].Kind] < order[objs[j].Kind] })
 
 	var results []string
-	err := s.store.Write(func(st *store.State) error {
-		results = results[:0]
+	var changes []ObjectChange
+	apply := func(st *store.State) error {
+		results, changes = results[:0], changes[:0]
 		for _, o := range objs {
 			if !api.ValidName(o.Namespace) {
 				return fmt.Errorf("invalid namespace %q", o.Namespace)
 			}
+			before := objectJSON(st, o.Kind, o.Namespace, o.Name)
 			res, err := s.applyObject(st, o)
 			if err != nil {
-				return err
+				return fmt.Errorf("%s/%s: %w", strings.ToLower(o.Kind), o.Name, err)
 			}
 			results = append(results, fmt.Sprintf("%s/%s %s", strings.ToLower(o.Kind), o.Name, res))
+			ch := ObjectChange{Object: strings.ToLower(o.Kind) + "/" + o.Name, NS: o.Namespace, Action: res}
+			if res != "unchanged" {
+				ch.Changes = diffObjects(o.Kind, before, objectJSON(st, o.Kind, o.Namespace, o.Name))
+			}
+			changes = append(changes, ch)
 		}
 		return nil
-	})
+	}
+	// A dry run applies to a copy of the state: validation, defaults and the
+	// diff, without changing anything.
+	dry := r.URL.Query().Get("dryRun") == "1"
+	var err error
+	if dry {
+		s.store.Read(func(st *store.State) { err = apply(st.Clone()) })
+	} else {
+		err = s.store.Write(apply)
+	}
 	if err != nil {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"results": results})
+	writeJSON(w, 200, map[string]any{"results": results, "changes": changes, "dryRun": dry})
 }
 
 func (s *Server) handleDeleteManifests(w http.ResponseWriter, r *http.Request) {

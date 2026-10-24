@@ -83,6 +83,10 @@ func (s *Server) applyObject(st *store.State, o api.Object) (string, error) {
 		return applyCRD(st, o)
 	case api.KindVolumeSnapshot:
 		return applyVolumeSnapshot(st, o)
+	case api.KindAgent:
+		return applyAgent(st, o)
+	case api.KindAgentRun:
+		return applyAgentRun(st, o)
 	case api.KindNode, api.KindToken:
 		return "", fmt.Errorf("kind %s cannot be applied", o.Kind)
 	}
@@ -496,6 +500,10 @@ func (s *Server) deleteObject(st *store.State, kind, ns, name string, force bool
 		}
 		delete(st.Policies, key)
 		st.Event("Normal", api.KindNetworkPolicy, ns, name, "Deleted", "network policy deleted")
+	case api.KindAgent:
+		return deleteAgent(st, ns, name)
+	case api.KindAgentRun:
+		return deleteAgentRun(st, ns, name)
 	case api.KindVolumeSnapshot:
 		if st.Snapshots[key] == nil {
 			return notFound("volumesnapshot/" + name)

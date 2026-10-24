@@ -14,6 +14,7 @@ import (
 
 	"github.com/thisisnabi/Nube/internal/agent"
 	"github.com/thisisnabi/Nube/internal/cli"
+	"github.com/thisisnabi/Nube/internal/runtime"
 	"github.com/thisisnabi/Nube/internal/server"
 )
 
@@ -30,6 +31,26 @@ func main() {
 			ctx, cancel := signalContext()
 			defer cancel()
 			<-ctx.Done()
+			os.Exit(0)
+		case "agent-run":
+			// Entry point of an agent run's runtime container.
+			ctx, cancel := signalContext()
+			defer cancel()
+			if err := runtime.Run(ctx); err != nil {
+				log.Printf("agent-run: %v", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "sandbox":
+			// Entry point of an agent run's sandbox container.
+			fs := flag.NewFlagSet("sandbox", flag.ExitOnError)
+			listen := fs.String("listen", "127.0.0.1:7979", "address to serve commands on")
+			workdir := fs.String("workdir", "", "working directory for commands")
+			fs.Parse(os.Args[2:])
+			if err := runtime.Sandbox(*listen, *workdir); err != nil {
+				log.Printf("sandbox: %v", err)
+				os.Exit(1)
+			}
 			os.Exit(0)
 		}
 	}

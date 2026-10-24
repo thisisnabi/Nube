@@ -2,3 +2,4 @@ dist/
 test/e2e/nube
 test/e2e/images/
 *.tar
+test/e2e/mockllm/mockllm

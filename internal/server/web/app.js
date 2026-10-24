@@ -16,10 +16,11 @@ const VIEWS = {
   overview: 'Overview', nodes: 'Nodes', deployments: 'Deployments', statefulsets: 'StatefulSets', daemonsets: 'DaemonSets',
   jobs: 'Jobs & CronJobs', pods: 'Pods', services: 'Services', ingresses: 'Ingress', policies: 'Network policies',
   volumes: 'Volumes & snapshots', config: 'Config & Secrets', custom: 'Custom resources',
+  agents: 'AI agents', approvals: 'Approvals', audit: 'Audit log',
   events: 'Events', tokens: 'Access tokens', cluster: 'Control Plane', apply: 'Apply YAML',
 };
-// Views with form inputs are rendered once, not on every poll.
-const STATIC_VIEWS = new Set(['apply', 'tokens']);
+// Views with form inputs (or fetched on demand) are rendered once, not on every poll.
+const STATIC_VIEWS = new Set(['apply', 'tokens', 'audit']);
 
 function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 function lsSet(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} }
@@ -195,6 +196,9 @@ function render(force) {
   $('#leader-pill').textContent = (c.mode === 'ha' ? `HA · leader ${c.leader || '—'} · ${c.members?.length || 0} servers` : 'single server') +
     ` · ${d.me.name} (${d.me.role})`;
   document.body.dataset.role = d.me.role;
+  const pending = (d.approvals || []).filter(a => a.status === 'Pending').length;
+  $('#approvals-badge').textContent = pending;
+  $('#approvals-badge').classList.toggle('hidden', !pending);
   const sel = $('#ns'), want = ['all', ...d.namespaces];
   if (sel.options.length !== want.length || [...sel.options].some((o, i) => o.value !== want[i])) {
     sel.innerHTML = want.map(n => `<option value="${esc(n)}">${n === 'all' ? 'All namespaces' : esc(n)}</option>`).join('');
@@ -211,6 +215,10 @@ function render(force) {
 }
 
 // ------------------------------------------------------------ views
+
+const RUN_CHIP = { Succeeded: 'ok', Failed: 'bad', Cancelled: 'info', Running: 'info', Queued: 'warn', WaitingApproval: 'warn' };
+const runChip = r => chip(r.status.phase, RUN_CHIP[r.status.phase] || 'info', r.status.phase === 'Running');
+const toolKind = t => t.http ? 'http' : t.sandbox ? 'sandbox' : t.mcp ? 'mcp' : t.nube ? 'nube (' + t.nube.role + ')' : t.agent ? 'agent' : '?';
 
 const renderers = {
   overview(d) {
@@ -441,6 +449,73 @@ const renderers = {
       }), 'No daemonsets. A DaemonSet runs one pod on every (matching) node — log shippers, monitoring agents…'));
   },
 
+  agents(d) {
+    const agents = d.agents.filter(inNS), runs = d.agentRuns.filter(inNS);
+    const agentCard = card(`AI agents <span class="muted">(${agents.length})</span>`, table(['Agent', 'Model', 'Tools', 'Runs', 'Tokens', ''],
+      agents.map(a => {
+        const id = `${esc(a.metadata.namespace)}|${esc(a.metadata.name)}`;
+        const extra = [(a.spec.schedules || []).length ? a.spec.schedules.length + ' schedule(s)' : '', a.spec.memory && a.spec.memory.enabled ? 'memory' : ''].filter(Boolean);
+        return `<tr><td class="name"><a data-describe="agents|${id}">${esc(a.metadata.name)}</a><div class="sub">${esc(a.metadata.namespace)}${extra.length ? ' · ' + extra.join(' · ') : ''}</div></td>
+          <td class="mono small">${esc(a.spec.model.provider)}/${esc(a.spec.model.name)}</td>
+          <td class="small">${(a.spec.tools || []).map(t => `<span class="tag" title="${esc(toolKind(t))}">${esc(t.name || toolKind(t))}${t.requireApproval ? ' ✋' : ''}</span>`).join(' ') || '<span class="muted">none</span>'}</td>
+          <td class="small">${a.status.running} running · ${a.status.queued} queued<div class="sub">${a.status.succeeded} succeeded · ${a.status.failed} failed</div></td>
+          <td>${(a.status.tokens || 0).toLocaleString()}</td>
+          <td class="actions btn-row" style="justify-content:flex-end"><button class="btn small" data-runagent="${id}">Run</button>
+            <button class="btn small danger" data-delete="agents|${id}">Delete</button></td></tr>`;
+      }), 'No agents yet. Create one with <code>kind: Agent</code> (there is a template in <a href="#apply">Apply YAML</a>).'));
+    const runCard = card(`Runs <span class="muted">(${runs.length})</span>`, table(['Run', 'Agent', 'Status', 'Input', 'Tokens', 'Started', ''],
+      runs.slice(0, 100).map(r => {
+        const id = `${esc(r.metadata.namespace)}|${esc(r.metadata.name)}`;
+        const u = r.status.usage || {};
+        const live = ['Queued', 'Running', 'WaitingApproval'].includes(r.status.phase);
+        return `<tr><td class="name"><a data-trace="${id}">${esc(r.metadata.name)}</a><div class="sub">${esc(r.spec.trigger || '')}${r.spec.session ? ' · session ' + esc(r.spec.session) : ''}${r.spec.parent ? ' · from ' + esc(r.spec.parent) : ''}</div></td>
+          <td>${esc(r.spec.agent)}</td>
+          <td>${runChip(r)}${r.status.approval ? `<div class="sub">waiting for <a href="#approvals">${esc(r.status.approval)}</a></div>` : ''}${r.status.message ? `<div class="sub trunc" title="${esc(r.status.message)}">${esc(r.status.message)}</div>` : ''}</td>
+          <td class="small trunc" title="${esc(r.spec.input)}">${esc(r.spec.input)}</td>
+          <td>${((u.inputTokens || 0) + (u.outputTokens || 0)).toLocaleString()}</td>
+          <td>${ago(r.status.startedAt || r.metadata.createdAt)}</td>
+          <td class="actions btn-row" style="justify-content:flex-end"><button class="btn small" data-trace="${id}">Trace</button>${live ? `<button class="btn small danger" data-cancelrun="${id}">Cancel</button>` : ''}</td></tr>`;
+      }), 'No runs yet. Press Run on an agent, or: <code>nube run AGENT "task"</code>'));
+    return agentCard + runCard;
+  },
+
+  approvals(d) {
+    const list = d.approvals.filter(a => S.ns === 'all' || !a.namespace || a.namespace === S.ns);
+    const admin = d.me.role === 'admin';
+    const state = a => {
+      if (a.status === 'Pending') {
+        return admin ? `<div class="btn-row"><button class="btn small" data-approve="${esc(a.id)}">Approve</button><button class="btn small danger" data-reject="${esc(a.id)}">Reject</button></div>` : chip('Pending', 'warn');
+      }
+      const kind = { Executed: 'ok', Approved: 'ok', Rejected: 'bad', Failed: 'bad', Expired: 'info' }[a.status] || 'info';
+      return chip(a.status, kind) + (a.decidedBy ? `<div class="sub">${esc(a.decidedBy)}${a.note ? ': ' + esc(a.note) : ''}</div>` : '') +
+        (a.result ? `<div class="sub trunc mono" title="${esc(a.result)}">${esc(a.result)}</div>` : '');
+    };
+    const row = a => `<tr><td class="mono small">${esc(a.id)}</td><td>${esc(a.requester)}</td>
+      <td>${a.tool ? `tool <b>${esc(a.tool)}</b><div class="sub mono trunc" title="${esc(a.input)}">${esc(a.input)}</div>` : esc(a.summary)}</td>
+      <td class="small">${esc(a.reason)}</td><td>${ago(a.createdAt)}</td><td>${state(a)}</td></tr>`;
+    const head = ['ID', 'Requester', 'What', 'Why', 'Age', ''];
+    const pending = list.filter(a => a.status === 'Pending'), done = list.filter(a => a.status !== 'Pending');
+    return card(`Waiting for a human <span class="muted">(${pending.length})</span>`, table(head, pending.map(row),
+      'Nothing is waiting. Tokens with role <code>agent</code> and agent tools with <code>requireApproval</code> ask here before destructive steps.')) +
+      card('Decided', table(head, done.map(row), 'No decisions yet.'));
+  },
+
+  audit(d) {
+    if (d.me.role !== 'admin') return card('Audit log', '<div class="empty">Only admins can read the audit log.</div>');
+    return card('Audit log <span class="muted">(every change made through the API)</span>', '<div id="audit-body"><div class="empty">Loading…</div></div>',
+      '<button class="btn small" data-auditrefresh="1">Refresh</button>');
+  },
+  async auditMounted() {
+    const box = $('#audit-body');
+    if (!box) return;
+    try {
+      const out = await api('/api/v1/audit?limit=300');
+      box.innerHTML = table(['When', 'Who', 'Role', 'Status', 'Change', 'Approval'], out.items.map(e => `<tr>
+        <td>${ago(e.time)} ago</td><td>${esc(e.who)}</td><td>${esc(e.role)}</td>
+        <td>${chip(e.status, e.status < 300 ? 'ok' : 'bad')}</td><td class="small">${esc(e.summary)}</td><td class="mono small">${esc(e.approval || '')}</td></tr>`), 'No changes recorded yet.');
+    } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  },
+
   policies(d) {
     const list = d.networkPolicies.filter(inNS);
     const peers = (rules, dir) => (rules || []).map(r => {
@@ -657,6 +732,30 @@ $('#view').addEventListener('click', async e => {
   const t = e.target.closest('button, a');
   if (!t) return;
   const ds = t.dataset;
+  if (ds.runagent) {
+    const [ns, name] = ds.runagent.split('|');
+    showRunForm(ns, name);
+    return;
+  } else if (ds.trace) {
+    const [ns, name] = ds.trace.split('|');
+    showTrace(ns, name);
+    return;
+  } else if (ds.cancelrun) {
+    const [ns, name] = ds.cancelrun.split('|');
+    act(post(objPath('agentruns', ns, name) + '/cancel'), 'Run cancelled');
+    return;
+  } else if (ds.approve) {
+    act(post('/api/v1/approvals/' + encodeURIComponent(ds.approve) + '/approve'), 'Approved');
+    return;
+  } else if (ds.reject) {
+    const note = prompt('Why? (the agent sees this)', '');
+    if (note === null) return;
+    act(post('/api/v1/approvals/' + encodeURIComponent(ds.reject) + '/reject', { note }), 'Rejected');
+    return;
+  } else if (ds.auditrefresh) {
+    renderers.auditMounted();
+    return;
+  }
   if (ds.scale) {
     const [ns, name, delta] = ds.scale.split('|');
     const dep = S.data.deployments.find(x => x.metadata.namespace === ns && x.metadata.name === name);
@@ -722,6 +821,7 @@ function openModal(title, body, actions = '') {
 }
 function closeModal() {
   if (S.logAbort) { S.logAbort.abort(); S.logAbort = null; }
+  clearTimeout(S.traceTimer);
   $('#modal').classList.add('hidden');
 }
 
@@ -731,6 +831,7 @@ const KINDS = {
   volumes: ['volumes', 'Volume'], configmaps: ['configMaps', 'ConfigMap'], secrets: ['secrets', 'Secret'],
   daemonsets: ['daemonSets', 'DaemonSet'], networkpolicies: ['networkPolicies', 'NetworkPolicy'],
   volumesnapshots: ['snapshots', 'VolumeSnapshot'], custom: ['custom', ''],
+  agents: ['agents', 'Agent'], agentruns: ['agentRuns', 'AgentRun'],
 };
 function findObj(kind, ns, name) {
   return (S.data[KINDS[kind][0]] || []).find(o => o.metadata.namespace === ns && o.metadata.name === name);
@@ -769,6 +870,48 @@ function recSection(r) {
     <tr><td>Recommended</td><td><b>${r.cpu}m</b></td><td><b>${r.memory}Mi</b></td></tr>` : '';
   return `<h3 class="small muted">RESOURCES PER POD (from ${r.minutes} min of usage)</h3>
     ${rows ? table(['', 'CPU', 'Memory'], [rows], '') : ''}<p class="small">${esc(r.message || '')}</p>`;
+}
+
+function showRunForm(ns, name) {
+  openModal(`Run agent ${ns}/${name}`,
+    `<label class="small muted">Task</label><textarea id="run-input" rows="6" style="width:100%" placeholder="What should the agent do?"></textarea>
+     <label class="small muted">Session (optional: continues a conversation when the agent has memory)</label><input id="run-session" style="width:100%">`,
+    `<button class="btn" id="run-go">Run</button>`);
+  $('#run-input').focus();
+  $('#run-go').onclick = async () => {
+    const input = $('#run-input').value.trim();
+    if (!input) return;
+    const run = await act(post(`/api/v1/namespaces/${encodeURIComponent(ns)}/agents/${encodeURIComponent(name)}/runs`, { input, session: $('#run-session').value.trim() }), 'Run started');
+    if (run && run.metadata) showTrace(ns, run.metadata.name);
+  };
+}
+
+// showTrace shows a run's steps and follows it while it is running.
+async function showTrace(ns, name) {
+  clearTimeout(S.traceTimer);
+  let r;
+  try { r = await api(objPath('agentruns', ns, name)); } catch (e) { toast(e.message, true); return; }
+  const steps = (r.status.steps || []).map(s => {
+    if (s.type === 'model') {
+      return `<div class="step"><div class="small muted">#${s.n} model · ${s.durationMs} ms · ${s.inputTokens} in / ${s.outputTokens} out · ${esc(s.stopReason || '')}</div>
+        ${s.text ? `<pre class="code">${esc(s.text)}</pre>` : ''}</div>`;
+    }
+    return `<div class="step"><div class="small muted">#${s.n} tool <b>${esc(s.tool)}</b> · ${s.durationMs} ms ${s.error ? chip('error', 'bad') : chip('ok', 'ok')}${s.approval ? ' · approval ' + esc(s.approval) : ''}</div>
+      ${s.input ? `<pre class="code small">${esc(s.input)}</pre>` : ''}<pre class="code small">${esc(s.output || '')}</pre></div>`;
+  }).join('');
+  const u = r.status.usage || {};
+  const live = ['Queued', 'Running', 'WaitingApproval'].includes(r.status.phase);
+  openModal(`Run ${ns}/${name} · agent ${r.spec.agent}`,
+    `<div class="btn-row">${runChip(r)} <span class="small muted">${(u.inputTokens || 0).toLocaleString()} in / ${(u.outputTokens || 0).toLocaleString()} out tokens · ${esc(r.spec.trigger || '')}</span></div>
+     ${r.status.approval ? `<p>Waiting for approval <a href="#approvals">${esc(r.status.approval)}</a>.</p>` : ''}
+     ${r.status.message ? `<p class="small">${esc(r.status.message)}</p>` : ''}
+     <h3 class="small muted">INPUT</h3><pre class="code">${esc(r.spec.input)}</pre>
+     <h3 class="small muted">STEPS</h3>${steps || '<div class="empty">No steps yet.</div>'}
+     ${r.status.output ? `<h3 class="small muted">OUTPUT</h3><pre class="code">${esc(r.status.output)}</pre>` : ''}`,
+    live ? `<button class="btn small danger" data-cancelrun-modal="1">Cancel run</button>` : '');
+  const b = document.querySelector('[data-cancelrun-modal]');
+  if (b) b.onclick = () => act(post(objPath('agentruns', ns, name) + '/cancel'), 'Run cancelled');
+  if (live) S.traceTimer = setTimeout(() => { if (!$('#modal').classList.contains('hidden')) showTrace(ns, name); }, 2000);
 }
 
 function showHistory(ns, name) {
@@ -833,6 +976,26 @@ async function showLogs(ns, name) {
 // ------------------------------------------------------------ templates
 
 const TEMPLATES = {
+  'AI agent': `# An AI agent that Nube runs. Store your key first:
+#   kind: Secret, metadata: {name: anthropic}, stringData: {ANTHROPIC_API_KEY: sk-ant-...}
+kind: Agent
+metadata:
+  name: ops-assistant
+spec:
+  model:
+    name: claude-opus-5-5          # or provider: openai + baseURL for any OpenAI-compatible server
+    apiKeySecret: anthropic
+  instructions: |
+    You help operate this cluster. Diagnose problems before changing anything,
+    and explain what you did.
+  tools:
+    - nube: { role: view }         # read the cluster through Nube's own tools
+    - name: shell
+      sandbox: { image: alpine:3.20 }
+      requireApproval: true        # a human approves each command
+  memory: { enabled: true }
+  limits: { maxSteps: 20, timeoutSeconds: 600 }
+`,
   'DaemonSet (per node)': `kind: DaemonSet
 metadata:
   name: node-logger

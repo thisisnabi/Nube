@@ -136,7 +136,7 @@ func (c *client) request(method, path string, body io.Reader, contentType string
 			time.Sleep(time.Duration(attempt+1) * time.Second)
 			continue
 		}
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 400 || resp.StatusCode == http.StatusAccepted && resp.Header.Get("X-Nube-Approval") != "" {
 			return nil, decodeErr(resp)
 		}
 		return resp, nil
@@ -144,19 +144,67 @@ func (c *client) request(method, path string, body io.Reader, contentType string
 	return nil, lastErr
 }
 
+// APIError is an error response from the server: a message, a stable code
+// (invalid, not_found, forbidden, approval_required ...) and a hint.
+type APIError struct {
+	Status  int            `json:"status"`
+	Message string         `json:"error"`
+	Code    string         `json:"code"`
+	Hint    string         `json:"hint,omitempty"`
+	Extra   map[string]any `json:"-"` // other fields, e.g. an approval id
+}
+
+func (e *APIError) Error() string { return e.Message }
+
+// Exit codes, so scripts and AI agents can branch without parsing text.
+const (
+	ExitError            = 1
+	ExitUsage            = 2
+	ExitNotFound         = 3
+	ExitForbidden        = 4 // also unauthenticated
+	ExitInvalid          = 5
+	ExitConflict         = 6
+	ExitUnavailable      = 7
+	ExitApprovalRequired = 8
+)
+
+func exitCode(err error) int {
+	var e *APIError
+	if !errors.As(err, &e) {
+		return ExitError
+	}
+	switch e.Code {
+	case "not_found":
+		return ExitNotFound
+	case "forbidden", "unauthenticated":
+		return ExitForbidden
+	case "invalid":
+		return ExitInvalid
+	case "conflict":
+		return ExitConflict
+	case "unavailable", "bad_gateway":
+		return ExitUnavailable
+	case "approval_required":
+		return ExitApprovalRequired
+	}
+	return ExitError
+}
+
 func decodeErr(resp *http.Response) error {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	var e struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal(b, &e) == nil && e.Error != "" {
-		if resp.StatusCode == 401 {
-			return errors.New(e.Error + " (run `nube login --server URL --token TOKEN`)")
+	e := &APIError{Status: resp.StatusCode}
+	if json.Unmarshal(b, e) == nil && e.Message != "" {
+		json.Unmarshal(b, &e.Extra)
+		delete(e.Extra, "error")
+		delete(e.Extra, "code")
+		delete(e.Extra, "hint")
+		if e.Code == "" {
+			e.Code = map[int]string{400: "invalid", 401: "unauthenticated", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable"}[resp.StatusCode]
 		}
-		return errors.New(e.Error)
+		return e
 	}
-	return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
+	return &APIError{Status: resp.StatusCode, Message: fmt.Sprintf("%s: %s", resp.Status, strings.TrimSpace(string(b))), Code: "error"}
 }
 
 func (c *client) getJSON(path string, out any) error {

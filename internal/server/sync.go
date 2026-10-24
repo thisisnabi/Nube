@@ -339,6 +339,11 @@ func (s *Server) resolveEnv(st *store.State, p *api.Pod, c api.Container) map[st
 	for k, v := range c.Env {
 		env[k] = v
 	}
+	if p.Spec.OwnerKind == api.KindAgentRun && c.Name == "runtime" {
+		if run := st.AgentRuns[ns+"/"+p.Spec.Owner]; run != nil && len(st.ConfigKey) > 0 {
+			env["NUBE_RUN_TOKEN"] = runToken(st, run) // never stored in the pod spec
+		}
+	}
 	env["NUBE_POD_NAME"] = p.Metadata.Name
 	env["NUBE_NAMESPACE"] = ns
 	env["NUBE_NODE_NAME"] = p.Spec.NodeName

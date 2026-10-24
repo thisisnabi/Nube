@@ -2,7 +2,8 @@
 
 Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور کانتینر کوچک ولی واقعی است که با Go نوشته شده.
 یک باینری (`nube`) هم control plane است، هم agent نودها و هم CLI. یک داشبورد وب هم داخلش embed شده.
-کانتینرها روی Docker یا Podman اجرا می‌شوند.
+کانتینرها روی Docker یا Podman اجرا می‌شوند. Nube **agentهای هوش مصنوعی** (Claude یا هر مدل سازگار با OpenAI) را هم مثل
+یک workload اجرا می‌کند، و agentها می‌توانند از طریق MCP به‌صورت امن **خود کلاستر را مدیریت کنند**.
 
 [English](README.md)
 
@@ -38,6 +39,8 @@ Nube (به اسپانیایی یعنی «ابر») یک ارکستریتور ک�
 | **امنیت** | **API روی HTTPS** با CA اختصاصی کلاستر (کلاینت‌ها hash آن را pin می‌کنند) یا گواهی Let's Encrypt یا گواهی خودتان برای داشبورد، **mutual TLS** بین سرور و agentها، **توکن‌های چندگانه با نقش** (`admin`، `edit`، `view`، `node`) و محدودسازی به namespace، و ماسک‌شدن مقدار secretها |
 | **High availability** | ۳ (یا ۵) سرور با **Raft** که در هر تغییر فقط همان بخش تغییرکرده را تکثیر می‌کند. در صورت از کار افتادن leader، ظرف چند ثانیه leader جدید انتخاب می‌شود. agentها خودکار به سرور سالم سوییچ می‌کنند |
 | **Runtime** | Docker یا Podman (از طریق API سازگار با Docker)، برای هر نود جداگانه |
+| **Agentهای هوش مصنوعی** | `kind: Agent`: مدل (Claude یا هر سرور سازگار با OpenAI مثل vLLM و Ollama)، دستورالعمل و ابزارها (سرویس‌های HTTP، سرورهای MCP، کانتینر sandbox برای دستورهای shell، agentهای دیگر و خود Nube). هر کار یک `AgentRun` در pod خودش است با trace کامل، سقف token و step، timeout، صف برای هر agent، حافظه‌ی session، زمان‌بندی cron و تأیید انسان برای ابزارهای پرخطر |
+| **مناسب برای agentها** | **MCP server** داخلی (`nube mcp`)، نقش `agent` که تغییرات مخربش منتظر **تأیید انسان** می‌ماند، **audit log**، `nube diagnose` (مشکل، شاهد و راه‌حل)، `--dry-run` و `nube diff`، `nube explain`، خطاهای JSON با کد ثابت و exit code |
 | **Observability** | داشبورد زنده، رویدادها، لاگ زنده‌ی هر کانتینر (`logs -c`)، مصرف CPU، RAM و دیسک، و **پیشنهاد مقدار درخواست CPU/RAM** بر اساس مصرف واقعی |
 
 ## چیزهایی که Kubernetes به add-on واگذار کرده
@@ -57,6 +60,8 @@ Kubernetes خیلی پخته‌تر است و اکوسیستم بزرگی دار
 | Ingress و load balancer روی سرور فیزیکی | نصب ingress controller و MetalLB | داخلی، روی همه‌ی سرورها |
 | NetworkPolicy | فقط با CNI‌ای که پشتیبانی کند (Calico، Cilium و ...) | داخلی |
 | اجرای control plane | etcd و چند جزء دیگر، و مدیریت گواهی‌ها | یک باینری؛ Raft و CA کلاستر داخلش هستند |
+| اجرای agentهای هوش مصنوعی | یک فریم‌ورک داخل image خودتان، به‌علاوه‌ی صف، بودجه، trace و فرایند تأیید که خودتان بسازید | `kind: Agent`: run، trace، بودجه، sandbox، حافظه و تأیید داخلی هستند |
+| مدیریت کلاستر به دست یک agent | یک MCP server شخص ثالث با تمام اختیارات kubeconfig | MCP server داخلی؛ نقش `agent` تغییرات مخرب را برای انسان نگه می‌دارد؛ همه‌ی تغییرات audit می‌شوند |
 
 جاهایی که Kubernetes انتخاب بهتری است: کلاسترهای بزرگ، سازگاری با `kubectl`، Helm و operatorهای موجود، سرویس‌های
 managed، و هر جا که یک پلتفرم استاندارد و آزموده لازم است.
@@ -79,8 +84,55 @@ managed، و هر جا که یک پلتفرم استاندارد و آزموده
 - **NFS:** volume از نوع `ReadWriteOnce` حجمش را رعایت کرد و همراه pod به نود دیگر رفت.
 - **Let's Encrypt:** با یک CA تستی ACME ‏(Pebble)، همه‌ی سرورها گواهی صادرشده را برای API و Ingress سرو کردند. بعد از توقف leader، leader جدید برای یک host تازه گواهی گرفت.
 - **Podman:** روی یک نود Podman، pod چندکانتینری، DNS، سرویس‌ها، volume با حجم اجباری و snapshot کار کردند.
+- **Agent:** یک run روی دو نود Podman (با یک جایگزین برای API مدل): pod مربوط به runtime از ابزارهای خود Nube استفاده کرد، دستور
+  sandbox را تا تأیید نگه داشت، آن را در کانتینر busybox اجرا کرد، trace و حافظه‌ی session را ثبت کرد و پاک شد؛ دستور رد‌شده به‌شکل
+  خطا به مدل رسید؛ پل MCP روی stdio ابزارهای `diagnose` و `run_agent` را سرو کرد. آداپتورهای Claude (SDK رسمی Go) و
+  OpenAI-compatible، تأییدها، محدودیت token، صف و timeout با تست در برابر API‌های شبیه‌سازی‌شده پوشش داده شده‌اند.
 - **Rollout هوشمند:** روی دو نود Podman، تغییر ConfigMap باعث rolling restart شد و سرویس مقدار جدید را برگرداند؛ کلاینتی با
   `dependsOn: [db]` تا آماده‌شدن db صبر کرد؛ rollout به imageای که وجود نداشت podهای قدیمی را نگه داشت و بعد از ۴۰ ثانیه خودکار rollback شد.
+
+---
+
+## Agentهای هوش مصنوعی
+
+```yaml
+kind: Agent
+metadata: { name: ops-assistant }
+spec:
+  model: { name: claude-opus-5-5, apiKeySecret: anthropic }   # Secret با کلید ANTHROPIC_API_KEY
+  instructions: You help operate this cluster. Diagnose before changing anything.
+  tools:
+    - nube: { role: view }                       # ابزارهای خود Nube: diagnose، لاگ، رویدادها ...
+    - name: shell
+      sandbox: { image: "alpine:3.20" }          # دستورها در یک کانتینر جدا اجرا می‌شوند
+      requireApproval: true                      # هر فراخوانی را یک انسان تأیید می‌کند
+    - agent: { name: researcher }                # واگذاری به agent دیگر (ابزار ask_researcher)
+  memory: { enabled: true }
+  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
+  schedules: [{ cron: "0 8 * * 1-5", input: "Summarize what needs attention today" }]
+```
+
+```bash
+nube run ops-assistant "Why is web degraded?" --session alice --wait
+nube trace RUN -w          # فراخوانی‌های مدل و ابزار، token‌ها و خروجی
+nube approvals             # فراخوانی‌هایی که منتظر انسان‌اند؛ nube approve|reject ID
+```
+
+control plane هر run را در صف می‌گذارد (همزمانی برای هر agent)، یک pod با **runtime** (imageای که هر نود از باینری `nube` خودش
+می‌سازد) و یک کانتینر برای هر ابزار sandbox می‌سازد، و به runtime توکنی می‌دهد که فقط برای همان run معتبر است و هیچ‌جا ذخیره
+نمی‌شود. runtime حلقه‌ی agent را با SDK رسمی Anthropic برای Go (یا کلاینت سازگار با OpenAI) اجرا می‌کند، هر گام را گزارش می‌دهد،
+برای تأیید می‌پرسد و با رسیدن به سقف step، token یا زمان متوقف می‌شود. نمونه‌ها در [`examples/agents`](examples/agents).
+
+## مدیریت به دست agentهای هوش مصنوعی
+
+```bash
+nube token create claude --role agent -n staging     # تغییر مجاز است؛ تغییرات مخرب منتظر انسان می‌مانند
+claude mcp add nube -- nube mcp                      # Claude Code (یا هر کلاینت MCP) ابزارهای Nube را می‌گیرد
+```
+
+ابزارهای MCP (`cluster_overview`، `diagnose`، `get_logs`، `explain`، `apply_manifest` با `dry_run`، `scale`، `rollout`،
+`delete_resource`، `run_agent` و ...) فراخوانی عادی API با توکن خود فراخوان هستند: نقش، namespace، تأیید و audit log
+همه اعمال می‌شوند. راهنما: [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -175,6 +227,11 @@ nube token create ci --role edit -n prod       # فقط یک بار نشان د�
 nube token list | nube token delete ci
 nube whoami
 nube top nodes|pods|workloads      # workloads: درخواست‌ها در برابر مقدار پیشنهادی
+nube diagnose [KIND NAME]          # چه چیزی خراب است، شاهد و راه‌حل
+nube diff -f app.yaml              # apply چه چیزی را عوض می‌کند، فیلد به فیلد
+nube explain [KIND]                # فیلدهای یک نوع و یک نمونه
+nube run AGENT "task" --wait | nube trace RUN -w | nube approvals | nube approve ID | nube audit
+nube mcp                           # MCP server روی stdio
 nube cordon|uncordon|drain NODE
 nube cluster status
 ```
@@ -271,6 +328,7 @@ spec:
 | `ingress.yaml` | Ingress با host و path |
 | `udp.yaml` | سرویس UDP |
 | `nfs-volume.yaml` | volume از نوع NFS |
+| `agents/` | دستیار عملیات (ابزارهای Nube، shell با تأیید، حافظه، زمان‌بندی)، تیم دو agentی، agent با مدل محلی |
 | `operator/` | یک CRD به نام `Website` و یک operator (با Go و `pkg/client`) که از آن Deployment، Service و Ingress می‌سازد |
 
 ---
@@ -313,6 +371,9 @@ spec:
 - volumeهای اشتراکی `nfs` ‏(`ReadWriteMany`) حجم اجباری ندارند و این با سرور NFS است.
 - هر سرور کل state را در حافظه نگه می‌دارد. این برای ده‌ها نود و چند هزار pod مناسب است.
 - فقط Docker و Podman پشتیبانی می‌شوند (containerd/CRI نه).
+- sandbox مربوط به agentها هم ایزوله‌سازی بیشتری از Docker یا Podman ندارد؛ برای ابزارهایی که دستور اجرا می‌کنند از `requireApproval` استفاده کنید.
+- trace و حافظه‌ی agentها در state تکثیرشده نگه داشته می‌شوند؛ هر گام حداکثر ۴KB و برای هر agent صد run آخر نگه داشته می‌شود.
+- workflowها با خود مدل هدایت می‌شوند (ابزار و واگذاری)؛ زبان تعریف گراف/workflow وجود ندارد.
 - ایزوله‌سازی podها بیشتر از آنچه Docker یا Podman می‌دهند نیست (user namespace، پروفایل seccomp سفارشی یا runtime ایزوله ندارد).
 
 ## توسعه و تست

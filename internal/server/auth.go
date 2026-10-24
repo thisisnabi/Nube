@@ -51,6 +51,11 @@ func (s *Server) authenticate(r *http.Request) *api.Identity {
 	if subtle.ConstantTimeCompare([]byte(tok), []byte(s.cfg.Token)) == 1 {
 		return &api.Identity{Name: "cluster-admin", Role: api.RoleAdmin}
 	}
+	if strings.HasPrefix(tok, runTokenPrefix) {
+		var ident *api.Identity
+		s.store.Read(func(st *store.State) { ident = runIdentity(st, tok) })
+		return ident
+	}
 	if !strings.HasPrefix(tok, tokenPrefix) {
 		return nil
 	}
@@ -68,7 +73,10 @@ func (s *Server) authenticate(r *http.Request) *api.Identity {
 	return ident
 }
 
-var roleRank = map[string]int{api.RoleView: 1, api.RoleEdit: 2, api.RoleAdmin: 3}
+// revealRole is the requirement for reading secret values: edit or admin.
+const revealRole = "reveal"
+
+var roleRank = map[string]int{api.RoleView: 1, api.RoleEdit: 2, api.RoleAgent: 2, api.RoleAdmin: 3}
 
 // requiredRole decides the minimum role for a request.
 func requiredRole(r *http.Request) string {
@@ -76,13 +84,17 @@ func requiredRole(r *http.Request) string {
 	switch {
 	case strings.HasPrefix(p, "/api/v1/agent/"):
 		return api.RoleNode
+	case strings.HasPrefix(p, "/api/v1/runtime/"):
+		return api.RoleRun
+	case p == "/api/v1/mcp":
+		return api.RoleView // each tool call is checked on its own
 	case p == "/api/v1/version" || p == "/api/v1/whoami":
 		return "" // any authenticated identity
-	case strings.HasPrefix(p, "/api/v1/tokens"), strings.HasPrefix(p, "/api/v1/cluster/"):
+	case strings.HasPrefix(p, "/api/v1/tokens"), strings.HasPrefix(p, "/api/v1/cluster/"), strings.HasPrefix(p, "/api/v1/audit"):
 		return api.RoleAdmin
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
 		if r.URL.Query().Get("reveal") == "1" {
-			return api.RoleEdit
+			return revealRole
 		}
 		return api.RoleView
 	case strings.HasPrefix(p, "/api/v1/nodes"):
@@ -97,9 +109,13 @@ func allowed(id *api.Identity, need string) bool {
 	switch {
 	case need == "":
 		return true
+	case need == revealRole:
+		return id.Role == api.RoleEdit || id.Role == api.RoleAdmin // agents never see secret values
 	case need == api.RoleNode:
 		return id.Role == api.RoleNode || id.Role == api.RoleAdmin
-	case id.Role == api.RoleNode:
+	case need == api.RoleRun:
+		return id.Role == api.RoleRun
+	case id.Role == api.RoleNode, id.Role == api.RoleRun:
 		return false
 	}
 	return roleRank[id.Role] >= roleRank[need]
@@ -118,18 +134,28 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*http.Reques
 		writeErr(w, http.StatusUnauthorized, "missing or invalid token")
 		return nil, false
 	}
-	if need := requiredRole(r); !allowed(id, need) {
-		writeErr(w, http.StatusForbidden, fmt.Sprintf("%s (role %s) may not do this; needs role %s", id.Name, id.Role, need))
+	if msg := accessDenied(id, r); msg != "" {
+		writeErr(w, http.StatusForbidden, msg)
 		return nil, false
+	}
+	return r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)), true
+}
+
+// accessDenied checks role and namespace for a request ("" = allowed).
+func accessDenied(id *api.Identity, r *http.Request) string {
+	if need := requiredRole(r); !allowed(id, need) {
+		if need == revealRole {
+			need = "edit"
+		}
+		return fmt.Sprintf("%s (role %s) may not do this; needs role %s", id.Name, id.Role, need)
 	}
 	if rest, ok := strings.CutPrefix(r.URL.Path, "/api/v1/namespaces/"); ok {
 		ns, _, _ := strings.Cut(rest, "/")
 		if !nsAllowed(id, ns) {
-			writeErr(w, http.StatusForbidden, fmt.Sprintf("%s may not access namespace %s", id.Name, ns))
-			return nil, false
+			return fmt.Sprintf("%s may not access namespace %s", id.Name, ns)
 		}
 	}
-	return r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)), true
+	return ""
 }
 
 // ---------------------------------------------------------------- token API
@@ -158,9 +184,9 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Role {
-	case api.RoleAdmin, api.RoleEdit, api.RoleView, api.RoleNode:
+	case api.RoleAdmin, api.RoleEdit, api.RoleView, api.RoleNode, api.RoleAgent:
 	default:
-		writeErr(w, 400, "role must be admin, edit, view or node")
+		writeErr(w, 400, "role must be admin, edit, agent, view or node")
 		return
 	}
 	for _, ns := range req.Namespaces {

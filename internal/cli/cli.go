@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -31,11 +32,11 @@ var valueFlags = map[string]string{
 	"f": "filename", "filename": "filename", "n": "namespace", "namespace": "namespace", "o": "output", "output": "output",
 	"server": "server", "token": "token", "replicas": "replicas", "tail": "tail", "to-revision": "to-revision",
 	"c": "container", "container": "container", "role": "role", "ca-hash": "ca-hash",
-	"to": "to", "name": "name",
+	"to": "to", "name": "name", "note": "note", "session": "session",
 }
 var boolFlags = map[string]string{
 	"A": "all-namespaces", "all-namespaces": "all-namespaces", "w": "watch", "watch": "watch", "force": "force",
-	"follow": "follow", "reveal": "reveal", "h": "help", "help": "help",
+	"follow": "follow", "reveal": "reveal", "h": "help", "help": "help", "dry-run": "dry-run", "wait": "wait",
 	"insecure-skip-tls-verify": "insecure-skip-tls-verify", "yes": "yes", "y": "yes",
 }
 
@@ -100,13 +101,15 @@ Control plane & nodes:
 
 Client:
   nube login --server URL --token T [--ca-hash sha256:...]   save connection settings
-  nube apply -f FILE|DIR|-            create or update resources from YAML/JSON
+  nube apply -f FILE|DIR|- [--dry-run] create or update resources from YAML/JSON
+  nube diff -f FILE|DIR|-             show what apply would change, field by field
   nube delete -f FILE                 delete resources in a manifest
   nube delete KIND NAME [--force]
   nube get KIND [NAME] [-n NS|-A] [-o wide|json|yaml] [-w]
         kinds: nodes deploy sts ds jobs cronjobs pods svc ing netpol cm secrets volumes
                snapshots crd tokens, and the plural of any custom resource
   nube describe KIND NAME
+  nube diagnose [KIND NAME] [-n NS|-A] what is broken, the evidence and how to fix it
   nube logs POD [-c CONTAINER] [-f] [--tail N]
   nube scale deploy|sts NAME --replicas N
   nube set image deploy|sts NAME IMAGE [-c CONTAINER]
@@ -120,7 +123,20 @@ Client:
   nube snapshot VOLUME [--name NAME]   take a snapshot (stored on the control plane)
   nube snapshot download NAME FILE     save a snapshot archive (.tar.gz)
   nube volume move VOLUME --to NODE    move a local volume to another node
-  nube token create NAME --role admin|edit|view|node [-n NS ...]
+  nube token create NAME --role admin|edit|agent|view|node [-n NS ...]
+        agent: for AI agents; like edit, but no secret values and destructive changes need approval
+AI agents (Nube runs them; see kind Agent):
+  nube run AGENT "task" [--session S] [--wait]   give an agent a task ("-" reads stdin)
+  nube trace RUN [-w]                  what a run did: model calls, tool calls, output
+  nube cancel RUN
+  nube memory AGENT [--session S]      conversation memory per session
+  nube get agents | agentruns
+For AI agents operating Nube:
+  nube mcp                             MCP server on stdio (claude mcp add nube -- nube mcp)
+  nube explain [KIND]                  fields of a kind and an example manifest
+  nube approvals [-A]                  requests waiting for a human (-A: decided ones too)
+  nube approve|reject ID [--note TEXT] decide; an approved call runs at once
+  nube audit [--name WHO] [--tail N]   every change made through the API
   nube token list | nube token delete NAME
   nube whoami
   nube cluster status                 control-plane members (HA)
@@ -129,6 +145,8 @@ Client:
   nube version
 
 Global flags: --server URL --token TOKEN --ca-hash HASH -n NAMESPACE
+For programs and AI agents: -o json (errors too, on stderr), NUBE_OUTPUT=json; exit codes
+  1 error, 2 usage, 3 not found, 4 forbidden, 5 invalid, 6 conflict, 7 unavailable, 8 approval required.
 Config: ~/.nube/config.json, or NUBE_SERVER / NUBE_TOKEN / NUBE_CA_HASH.
 `
 
@@ -164,7 +182,14 @@ func Run(argv []string) int {
 			fmt.Printf("%s (role %s, %s) at %s\n", id.Name, id.Role, ns, c.cfg.Server)
 		}
 	case "apply":
-		err = cmdApply(c, a, "/api/v1/apply")
+		path := "/api/v1/apply"
+		if a.flags["dry-run"] != "" {
+			path += "?dryRun=1"
+		}
+		err = cmdApply(c, a, path)
+	case "diff":
+		a.flags["dry-run"] = "true"
+		err = cmdApply(c, a, "/api/v1/apply?dryRun=1")
 	case "delete":
 		if a.flags["filename"] != "" {
 			path := "/api/v1/delete"
@@ -177,6 +202,26 @@ func Run(argv []string) int {
 		}
 	case "get":
 		err = cmdGet(c, a, rest)
+	case "diagnose", "doctor":
+		err = cmdDiagnose(c, a, rest)
+	case "approvals":
+		err = cmdApprovals(c, a)
+	case "approve", "reject":
+		err = cmdDecide(c, a, cmd, rest)
+	case "audit":
+		err = cmdAudit(c, a)
+	case "run":
+		err = cmdRun(c, a, rest)
+	case "trace":
+		err = cmdTrace(c, a, rest)
+	case "cancel":
+		err = cmdCancelRun(c, a, rest)
+	case "memory":
+		err = cmdMemory(c, a, rest)
+	case "mcp":
+		err = cmdMCP(c)
+	case "explain":
+		err = cmdExplain(c, a, rest)
 	case "describe":
 		err = cmdDescribe(c, a, rest)
 	case "logs", "log":
@@ -215,10 +260,41 @@ func Run(argv []string) int {
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return reportErr(a, err)
 	}
 	return 0
+}
+
+// reportErr prints an error (as JSON with -o json or NUBE_OUTPUT=json, for
+// programs and AI agents) and returns the exit code for its kind.
+func reportErr(a args, err error) int {
+	code := exitCode(err)
+	if a.flags["output"] == "json" || os.Getenv("NUBE_OUTPUT") == "json" {
+		out := map[string]any{"error": err.Error(), "code": "error", "exitCode": code}
+		var e *APIError
+		if errors.As(err, &e) {
+			out["code"], out["status"] = e.Code, e.Status
+			if e.Hint != "" {
+				out["hint"] = e.Hint
+			}
+			for k, v := range e.Extra {
+				out[k] = v
+			}
+		}
+		b, _ := json.Marshal(out)
+		fmt.Fprintln(os.Stderr, string(b))
+		return code
+	}
+	fmt.Fprintln(os.Stderr, "error:", err)
+	var e *APIError
+	if errors.As(err, &e) {
+		if id, ok := e.Extra["approval"].(string); ok {
+			fmt.Fprintf(os.Stderr, "approval request: %s (an admin runs: nube approve %s)\n", id, id)
+		} else if e.Hint != "" {
+			fmt.Fprintln(os.Stderr, "hint:", e.Hint)
+		}
+	}
+	return code
 }
 
 func cmdLogin(c *client, a args) error {
@@ -329,14 +405,57 @@ func cmdApply(c *client, a args, path string) error {
 		}
 		path += sep + "namespace=" + url.QueryEscape(n)
 	}
-	var out struct {
-		Results []string `json:"results"`
-	}
-	if err := c.send("POST", path, body, "application/yaml", &out); err != nil {
+	var raw json.RawMessage
+	if err := c.send("POST", path, body, "application/yaml", &raw); err != nil {
 		return err
 	}
-	for _, r := range out.Results {
-		fmt.Println(r)
+	if a.flags["output"] == "json" {
+		fmt.Println(string(raw))
+		return nil
+	}
+	var out struct {
+		Results []string `json:"results"`
+		Changes []struct {
+			Object  string `json:"object"`
+			NS      string `json:"namespace"`
+			Action  string `json:"action"`
+			Changes []struct {
+				Path string `json:"path"`
+				Old  any    `json:"old"`
+				New  any    `json:"new"`
+			} `json:"changes"`
+		} `json:"changes"`
+	}
+	json.Unmarshal(raw, &out)
+	if a.flags["dry-run"] == "" {
+		for _, r := range out.Results {
+			fmt.Println(r)
+		}
+		return nil
+	}
+	// Dry run / diff: what would change, field by field.
+	for _, o := range out.Changes {
+		what := "unchanged"
+		switch o.Action {
+		case "created":
+			what = "would be created"
+		case "configured":
+			what = "would be configured"
+		}
+		fmt.Printf("%s %s (dry run)\n", o.Object, what)
+		if o.Action == "created" {
+			continue
+		}
+		for _, ch := range o.Changes {
+			switch {
+			case ch.Old == nil:
+				fmt.Printf("  + %s: %v\n", ch.Path, ch.New)
+			case ch.New == nil:
+				fmt.Printf("  - %s: %v\n", ch.Path, ch.Old)
+			default:
+				fmt.Printf("  ~ %s: %v -> %v\n", ch.Path, ch.Old, ch.New)
+			}
+		}
 	}
 	return nil
 }
@@ -735,6 +854,30 @@ func printTable(kind string, items []json.RawMessage, wide, showNS bool) error {
 			json.Unmarshal(raw, &d)
 			fmt.Fprintf(w, "%s%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n", nsCol(d.Metadata.Namespace), d.Metadata.Name, d.Status.DesiredNumber,
 				d.Status.Current, d.Status.Ready, d.Status.Updated, d.Status.Phase, d.Spec.Template.MainImage(), age(d.Metadata.CreatedAt))
+		}
+	case api.KindAgent:
+		fmt.Fprintln(w, nsHead+"NAME\tMODEL\tTOOLS\tRUNNING\tQUEUED\tSUCCEEDED\tFAILED\tTOKENS\tLAST RUN\tAGE")
+		for _, raw := range items {
+			var ag api.Agent
+			json.Unmarshal(raw, &ag)
+			last := "-"
+			if ag.Status.LastRun != "" {
+				last = ag.Status.LastRun + " (" + age(ag.Status.LastRunAt) + ")"
+			}
+			fmt.Fprintf(w, "%s%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", nsCol(ag.Metadata.Namespace), ag.Metadata.Name, ag.Spec.Model.Name, len(ag.Spec.Tools),
+				ag.Status.Running, ag.Status.Queued, ag.Status.Succeeded, ag.Status.Failed, ag.Status.Tokens, last, age(ag.Metadata.CreatedAt))
+		}
+	case api.KindAgentRun:
+		fmt.Fprintln(w, nsHead+"NAME\tAGENT\tPHASE\tSTEPS\tTOKENS\tTRIGGER\tINPUT\tAGE")
+		for _, raw := range items {
+			var r api.AgentRun
+			json.Unmarshal(raw, &r)
+			phase := r.Status.Phase
+			if r.Status.Approval != "" {
+				phase += " (" + r.Status.Approval + ")"
+			}
+			fmt.Fprintf(w, "%s%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n", nsCol(r.Metadata.Namespace), r.Metadata.Name, r.Spec.Agent, phase, len(r.Status.Steps),
+				r.Status.Usage.InputTokens+r.Status.Usage.OutputTokens, r.Spec.Trigger, truncate(r.Spec.Input, 40), age(r.Metadata.CreatedAt))
 		}
 	case api.KindNetworkPolicy:
 		fmt.Fprintln(w, nsHead+"NAME\tPOD-SELECTOR\tTYPES\tPODS\tAGE")
@@ -1360,5 +1503,63 @@ func cmdVolume(c *client, a args, rest []string) error {
 		return err
 	}
 	fmt.Println(out["status"])
+	return nil
+}
+
+func cmdDiagnose(c *client, a args, rest []string) error {
+	q := url.Values{}
+	if a.flags["all-namespaces"] == "" && (a.flags["namespace"] != "" || len(rest) > 0) {
+		q.Set("namespace", a.ns())
+	}
+	if len(rest) > 0 {
+		kind, name, ok := strings.Cut(rest[0], "/")
+		if !ok {
+			if len(rest) < 2 {
+				return fmt.Errorf("usage: nube diagnose [KIND NAME] [-n NS | -A]")
+			}
+			kind, name = rest[0], rest[1]
+		}
+		q.Set("kind", kind)
+		q.Set("name", name)
+	}
+	var raw json.RawMessage
+	if err := c.getJSON("/api/v1/diagnose?"+q.Encode(), &raw); err != nil {
+		return err
+	}
+	if a.flags["output"] == "json" {
+		fmt.Println(string(raw))
+		return nil
+	}
+	var d struct {
+		Summary  string `json:"summary"`
+		Findings []struct {
+			Severity, Object, Namespace, Problem, Fix, Command, Logs string
+			Evidence                                                 []string
+		} `json:"findings"`
+	}
+	json.Unmarshal(raw, &d)
+	fmt.Println(d.Summary)
+	for _, f := range d.Findings {
+		obj := f.Object
+		if f.Namespace != "" && f.Namespace != api.DefaultNamespace {
+			obj = f.Namespace + "/" + obj
+		}
+		fmt.Printf("\n[%s] %s: %s\n", strings.ToUpper(f.Severity), obj, f.Problem)
+		for _, e := range f.Evidence {
+			if e != "" {
+				fmt.Println("  evidence:", e)
+			}
+		}
+		fmt.Println("  fix:     ", f.Fix)
+		if f.Command != "" {
+			fmt.Println("  try:     ", f.Command)
+		}
+		if f.Logs != "" {
+			fmt.Println("  last log lines:")
+			for _, l := range strings.Split(f.Logs, "\n") {
+				fmt.Println("    " + l)
+			}
+		}
+	}
 	return nil
 }

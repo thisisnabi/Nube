@@ -72,6 +72,7 @@ type Server struct {
 	acme    *acmeManager
 	certs   *certs
 	live    *liveStats
+	mux     *http.ServeMux // the routes, without auth (approved calls are replayed here)
 	started time.Time
 	http    *http.Server
 }
@@ -155,6 +156,7 @@ func (s *Server) Token() string { return s.cfg.Token }
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	s.routes(mux)
+	s.mux = mux
 	s.http = &http.Server{
 		Handler:           s.middleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -256,6 +258,15 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			s.forwardToLeader(w, r)
 			return
 		}
+		id := identityFrom(r)
+		r, held := s.guard(w, r, id)
+		if held {
+			return
+		}
+		if audited(r, id) {
+			s.serveAudited(next, w, r, id)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -292,8 +303,39 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	enc.Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+// apiError is the body of every error response: a message for people, a
+// stable code and a hint on what to do next for programs and AI agents.
+type apiError struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+	Hint  string `json:"hint,omitempty"`
+}
+
+func errorCode(status int) (code, hint string) {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return "invalid", "fix the request or manifest; `nube explain KIND` lists the fields"
+	case http.StatusUnauthorized:
+		return "unauthenticated", "pass a token (nube login, or NUBE_TOKEN)"
+	case http.StatusForbidden:
+		return "forbidden", "check your role with `nube whoami`; an admin can issue a token with more rights"
+	case http.StatusNotFound:
+		return "not_found", "list what exists with `nube get KIND`"
+	case http.StatusConflict:
+		return "conflict", "read the current object and retry"
+	case http.StatusAccepted:
+		return "approval_required", "a human must approve this: `nube approvals` / `nube approve ID`"
+	case http.StatusServiceUnavailable:
+		return "unavailable", "retry in a few seconds (leader election or startup)"
+	case http.StatusBadGateway:
+		return "bad_gateway", "a server or node could not be reached; retry"
+	}
+	return "error", ""
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	code, hint := errorCode(status)
+	writeJSON(w, status, apiError{Error: msg, Code: code, Hint: hint})
 }
 
 // writeStoreErr maps store errors to HTTP status codes.

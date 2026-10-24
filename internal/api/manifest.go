@@ -153,6 +153,10 @@ func NormalizeKind(k string) string {
 		return KindCRD
 	case "volumesnapshot", "volumesnapshots", "snapshot", "snapshots", "vs":
 		return KindVolumeSnapshot
+	case "agent", "agents":
+		return KindAgent
+	case "agentrun", "agentruns", "run", "runs":
+		return KindAgentRun
 	}
 	return ""
 }
@@ -192,6 +196,10 @@ func Plural(kind string) string {
 		return "customresourcedefinitions"
 	case KindVolumeSnapshot:
 		return "volumesnapshots"
+	case KindAgent:
+		return "agents"
+	case KindAgentRun:
+		return "agentruns"
 	}
 	return strings.ToLower(kind) + "s"
 }

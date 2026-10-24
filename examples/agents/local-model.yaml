@@ -1,0 +1,42 @@
+# An agent on a model served inside the cluster: any OpenAI-compatible API
+# works (Ollama, vLLM, LM Studio, llama.cpp server, OpenAI itself).
+#
+#   nube apply -f examples/agents/local-model.yaml
+#   nube run summarizer "Summarize: $(cat notes.txt)" --wait
+kind: Deployment
+metadata: { name: ollama }
+spec:
+  replicas: 1
+  template:
+    image: ollama/ollama:latest
+    ports: [{ containerPort: 11434 }]
+    resources: { cpu: "4", memory: 8Gi }
+    volumes: [{ volume: ollama-models, containerPath: /root/.ollama }]
+---
+kind: Volume
+metadata: { name: ollama-models }
+spec: { type: local, size: 20Gi }
+---
+kind: Service
+metadata: { name: ollama }
+spec: { internal: true, ports: [{ port: 11434 }] }
+---
+kind: Agent
+metadata: { name: summarizer }
+spec:
+  model:
+    provider: openai
+    name: llama3.1                         # pulled once by the job below
+    baseURL: http://ollama.default:11434/v1
+  instructions: Summarize the text you are given in five bullet points.
+  limits: { maxSteps: 3, timeoutSeconds: 600 }
+---
+kind: Job
+metadata: { name: pull-llama }
+spec:
+  template:
+    image: ollama/ollama:latest
+    env: { OLLAMA_HOST: "http://ollama.default:11434" }
+    command: ["ollama", "pull", "llama3.1"]
+    dependsOn: [ollama]
+    restartPolicy: OnFailure

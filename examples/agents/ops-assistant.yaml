@@ -1,0 +1,38 @@
+# An AI agent that Nube runs: it reads the cluster through Nube's own tools,
+# runs shell commands in a sandbox only after a human approves each one, and
+# remembers each user's conversation.
+#
+#   nube apply -f examples/agents/ops-assistant.yaml
+#   nube run ops-assistant "Why is the web deployment degraded?" --session alice --wait
+#   nube approvals            # approve or reject the shell commands it wants to run
+#   nube trace RUN            # every model call and tool call
+kind: Secret
+metadata: { name: anthropic }
+stringData:
+  ANTHROPIC_API_KEY: sk-ant-REPLACE-ME
+---
+kind: Agent
+metadata: { name: ops-assistant }
+spec:
+  model:
+    name: claude-opus-5-5
+    apiKeySecret: anthropic
+    effort: high
+  instructions: |
+    You help operate this Nube cluster. Start with diagnose or cluster_overview,
+    look at logs and events before drawing conclusions, and explain the cause
+    and the fix in plain words. Only use the shell when the cluster tools are
+    not enough.
+  tools:
+    - nube: { role: view }           # diagnose, list/get resources, logs, events, top_workloads ...
+    - name: shell
+      description: Run a shell command in an Alpine sandbox (curl, dig, nc are available after apk add).
+      sandbox: { image: "alpine:3.20", timeoutSeconds: 120 }
+      requireApproval: true
+  memory: { enabled: true, maxMessages: 40 }
+  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
+  schedules:
+    - cron: "0 8 * * 1-5"
+      timeZone: Asia/Tehran
+      input: Check the cluster and summarize anything that needs attention today.
+      session: daily-report

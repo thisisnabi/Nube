@@ -4,7 +4,8 @@
 
 One binary (`nube`) is the control plane, the node agent and the CLI, with a web dashboard built in.
 It runs your containers on Docker or Podman across one or many Linux machines, keeps them healthy, networks them
-together, and survives the loss of a node or a control-plane server.
+together, and survives the loss of a node or a control-plane server. It also **runs AI agents** (Claude or any
+OpenAI-compatible model) as first-class workloads, and AI agents can **operate it** safely through MCP.
 
 [فارسی](README.fa.md)
 
@@ -44,6 +45,8 @@ together, and survives the loss of a node or a control-plane server.
 | **High availability** | 3 or 5 servers replicated with **Raft**, which ships only what changed in each write; a new leader is elected within seconds and agents fail over automatically |
 | **Runtimes** | Docker or Podman (through its Docker-compatible API), chosen per node |
 | **Observability** | Live dashboard, events, streaming logs per container, CPU/memory/disk usage, `nube top`, **CPU/memory request recommendations** from observed usage |
+| **AI agents** | `kind: Agent`: a model (Claude, or any OpenAI-compatible server such as vLLM or Ollama), instructions and tools (HTTP services, MCP servers, a sandbox container for shell commands, other agents, Nube itself). Every task is an `AgentRun` in its own pod with a full trace, token and step budgets, timeouts, a queue per agent, session memory, cron schedules and human approval for risky tools |
+| **Agent-friendly** | Built-in **MCP server** (`nube mcp`), `agent` role whose destructive changes wait for **human approval**, **audit log**, `nube diagnose` (problem, evidence, fix), `--dry-run` / `nube diff`, `nube explain`, JSON errors with stable codes and exit codes |
 
 ## What you get that Kubernetes leaves to add-ons
 
@@ -62,6 +65,8 @@ itself: you find, install, configure and upgrade a separate project for each. In
 | Ingress and a load balancer on bare metal | Install an ingress controller and MetalLB | Built in on every server |
 | Network policies | Only with a CNI that supports them (Calico, Cilium ...) | Built in |
 | Running the control plane | etcd plus several components, certificates to manage | One binary; Raft and the cluster CA are built in |
+| Running AI agents | A framework in your own image, plus your own queue, budgets, traces and approval flow | `kind: Agent`: runs, traces, budgets, sandboxes, memory and approvals are built in |
+| Letting an AI agent operate the cluster | A third-party MCP server with the full rights of a kubeconfig | Built-in MCP server; the `agent` role holds destructive changes for a human; every change is audited |
 
 Where Kubernetes is the better choice: big clusters, `kubectl`/Helm/operator ecosystem compatibility, managed offerings,
 and anything that needs a certified, battle-tested platform.
@@ -88,7 +93,60 @@ On a Docker test cluster (3 HA servers with TLS + Docker-in-Docker and Podman no
 - on a Podman node, multi-container pods, DNS, services, sized volumes and snapshots worked;
 - on two Podman nodes: changing a ConfigMap rolled the pods and the service answered with the new value; a client with
   `dependsOn: [db]` waited until db was ready; a rollout to an image that does not exist kept the old pods serving and was
-  rolled back automatically after its 40-second deadline.
+  rolled back automatically after its 40-second deadline;
+- an agent run on two Podman nodes (with a stand-in for the model API): its runtime pod used Nube's own tools, held a
+  sandbox command until it was approved, ran it in a busybox sandbox container, recorded the trace, kept the session
+  memory and was cleaned up; a rejected command reached the model as a refusal; the stdio MCP bridge served `diagnose`
+  and `run_agent`; the Claude (official Go SDK) and OpenAI-compatible adapters, approvals, token scoping, queueing and
+  timeouts are covered by tests against mock APIs.
+
+---
+
+## AI agents
+
+```yaml
+kind: Agent
+metadata: { name: ops-assistant }
+spec:
+  model: { name: claude-opus-5-5, apiKeySecret: anthropic }   # Secret with ANTHROPIC_API_KEY
+  instructions: You help operate this cluster. Diagnose before changing anything.
+  tools:
+    - nube: { role: view }                       # Nube's own tools: diagnose, logs, events ...
+    - name: shell
+      sandbox: { image: "alpine:3.20" }          # commands run in a separate container
+      requireApproval: true                      # a human approves each call
+    - name: search_kb
+      http: { service: kb, port: 8080, path: /search }
+      inputSchema: { type: object, properties: { q: { type: string } }, required: [q] }
+    - agent: { name: researcher }                # delegate to another agent (tool ask_researcher)
+  memory: { enabled: true }
+  limits: { maxSteps: 25, maxTokens: 400000, timeoutSeconds: 900, concurrency: 2 }
+  schedules: [{ cron: "0 8 * * 1-5", input: "Summarize what needs attention today" }]
+```
+
+```bash
+nube run ops-assistant "Why is web degraded?" --session alice --wait
+nube trace RUN -w          # model calls, tool calls, tokens, output
+nube approvals             # tool calls waiting for a human; nube approve|reject ID
+nube memory ops-assistant --session alice
+```
+
+How it works: the control plane queues each run (per-agent concurrency), creates a pod with the **runtime** (an image
+every node builds from its own `nube` binary) and one container per sandbox tool, and gives the runtime a token that is
+valid for that run only and never stored. The runtime runs the agent loop with the official Anthropic Go SDK (or an
+OpenAI-compatible client), reports every step, asks for approvals and stops at the step, token or time budget.
+More in [`examples/agents`](examples/agents) and `nube explain agent`.
+
+## Operated by AI agents
+
+```bash
+nube token create claude --role agent -n staging     # changes allowed; destructive ones wait for a human
+claude mcp add nube -- nube mcp                      # Claude Code (or any MCP client) gets Nube's tools
+```
+
+The MCP tools (`cluster_overview`, `diagnose`, `get_logs`, `explain`, `apply_manifest` with `dry_run`, `scale`,
+`set_image`, `rollout`, `delete_resource`, `run_agent` ...) are ordinary API calls with the caller's token: roles,
+namespaces, approvals and the audit log apply. See [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -200,6 +258,12 @@ nube token create ci --role edit -n prod                 # the secret is shown o
 nube token list | nube token delete ci
 nube whoami
 nube top nodes|pods|workloads                            # workloads: requests vs. recommended
+nube diagnose [KIND NAME] [-n NS | -A]                   # what is broken, the evidence and the fix
+nube apply -f app.yaml --dry-run | nube diff -f app.yaml # what would change, field by field
+nube explain [KIND]                                      # fields of a kind and an example
+nube run AGENT "task" [--session S] [--wait] | nube trace RUN [-w] | nube cancel RUN
+nube approvals | nube approve|reject ID [--note TEXT] | nube audit
+nube mcp                                                 # MCP server on stdio
 nube cordon|uncordon|drain NODE
 nube label node NAME key=value
 nube events -w
@@ -302,6 +366,7 @@ Complete examples in [`examples/`](examples):
 | `udp.yaml` | UDP service |
 | `nfs-volume.yaml` | NFS volume |
 | `operator/` | A `Website` CRD and an operator (Go, using `pkg/client`) that turns websites into deployments, services and ingresses |
+| `agents/` | An ops assistant (Nube tools, approved shell, memory, schedule), a two-agent team, an agent on a local model |
 
 ---
 
@@ -335,6 +400,8 @@ Complete examples in [`examples/`](examples):
   See `internal/server/rollout.go`.
 - **Recommendations.** Once a minute the leader records the highest per-pod usage of every workload (one day, in memory).
   CPU is suggested at the 95th percentile + 15%, memory at the peak + 20%, because memory is also the container's limit.
+- **Agents.** `internal/server/agents.go` (queue, pods, run tokens, memory), `internal/runtime` (the agent loop, model
+  adapters, tools, MCP client, sandbox server), `internal/server/mcp.go` (Nube's MCP server) and `guard.go` (approvals, audit).
 - **Custom resources.** A CRD adds a kind to the API, with a JSON-schema subset for validation and defaults. Operators use
   `watch` (long polling on resource versions) and write `status`; objects labelled `nube/owned-by=Kind/name` are deleted
   with their owner. See `internal/server/crd.go` and `examples/operator`.
@@ -350,6 +417,9 @@ Complete examples in [`examples/`](examples):
 - Every server holds the whole state in memory: good for tens of nodes and a few thousand pods.
 - Only the Docker and Podman runtimes are supported (no containerd/CRI).
 - Pods get no isolation beyond what Docker or Podman provide (no user namespaces, custom seccomp profiles or sandbox runtimes).
+  The same goes for agent sandboxes: use `requireApproval` for tools that run commands.
+- Agent runs keep their trace and memory in the replicated state; long traces are cut at 4 KB per step and 100 runs per agent are kept.
+- Agent workflows are model-driven (tools and delegation); there is no graph/workflow DSL.
 
 ## Development
 
@@ -362,13 +432,14 @@ bash test/e2e/up.sh    # local test cluster on Docker: 3 HA servers with TLS + 2
 Project layout:
 
 ```
-cmd/nube/            main: server | agent | pause | CLI
+cmd/nube/            main: server | agent | pause | agent-run | sandbox | CLI
 internal/api/        resource types, manifest parsing, quantities
 internal/store/      state, file store, Raft store
 internal/server/     API, auth, scheduler, controllers, load balancer, ingress, dashboard (web/)
 internal/agent/      Docker/Podman client, pods, networking, firewall, DNS, volumes, snapshots
 internal/proxy/      TCP/UDP load balancer
 internal/pki/        cluster CA and pinned TLS
+internal/runtime/    AI agent runtime: agent loop, Claude / OpenAI-compatible adapters, tools, sandbox
 internal/cli/        kubectl-style client
 pkg/client/          Go client for operators
 deploy/              installer and systemd units

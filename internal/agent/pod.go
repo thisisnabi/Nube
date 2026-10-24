@@ -597,7 +597,14 @@ func (a *Agent) startContainer(ap api.AssignedPod, ps *podState, c api.Container
 }
 
 func (a *Agent) createContainer(ctx context.Context, ap api.AssignedPod, ps *podState, st *ctrState, c api.Container, init bool, pauseID string) (string, error) {
-	if err := a.docker.EnsureImage(ctx, c.Image, c.ImagePullPolicy); err != nil {
+	if c.Image == api.RuntimeImage {
+		// The agent runtime: the image built from this binary (like pause).
+		ref, err := a.ensurePauseImage(ctx)
+		if err != nil {
+			return "", err
+		}
+		c.Image = ref
+	} else if err := a.docker.EnsureImage(ctx, c.Image, c.ImagePullPolicy); err != nil {
 		return "", fmt.Errorf("pull %s: %w", c.Image, err)
 	}
 	a.mu.Lock()
@@ -643,6 +650,13 @@ func (a *Agent) createContainer(ctx context.Context, ap api.AssignedPod, ps *pod
 // backing storage (sized filesystem, Docker volume or directory) if needed.
 func (a *Agent) prepareMount(ctx context.Context, ap api.AssignedPod, vm api.VolumeMount) (Mount, error) {
 	switch {
+	case vm.HostPath == api.NubeBinary:
+		// This binary, for an agent run's sandbox containers ("nube sandbox").
+		exe, err := os.Executable()
+		if err != nil {
+			return Mount{}, err
+		}
+		return Mount{Type: "bind", Source: exe, Target: vm.ContainerPath, ReadOnly: true}, nil
 	case vm.HostPath != "":
 		os.MkdirAll(vm.HostPath, 0o755)
 		return Mount{Type: "bind", Source: vm.HostPath, Target: vm.ContainerPath, ReadOnly: vm.ReadOnly}, nil
